@@ -630,6 +630,31 @@ class TalkerSubmodule(ARNodeSubmodule):
             state.add(
                 "generated_frames", int(state.get("generated_frames", 0)) + 1
             )
+        self._accumulate_alignment_frame(request_id)
+
+    def _accumulate_alignment_frame(self, request_id: str) -> None:
+        """Hand this frame's aux hidden state to the word-alignment registry.
+
+        This is the per-request, per-frame hook the alignment capture needs, and
+        it is the direct analogue of vllm-omni's runner -> accumulate_decode
+        seam — cleaner, because M* routes the frame's tensors per request here
+        rather than requiring a query_start_loc slice out of a batched tensor.
+
+        Never raises: alignment is a sidecar, and a failure in it must not cost
+        the caller their audio.
+        """
+        if getattr(self.model, "alignment_head", None) is None:
+            return
+        aux = getattr(self.model, "last_aux_hidden_state", None)
+        if aux is None:
+            return
+        try:
+            from mstar.model.qwen3_tts.temporal_alignment.registry import get_registry
+
+            row = aux[-1] if aux.dim() == 2 else aux
+            get_registry().accumulate_decode(request_id, row.detach())
+        except Exception:  # noqa: BLE001 — a sidecar must not break generation
+            pass
 
     def check_stop(
         self,
