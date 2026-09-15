@@ -93,8 +93,17 @@ def _conductor_process_target(
             "yaml %s has no model_kwargs section; using model defaults", config_path
         )
 
+    # A yaml ``model_kwargs.model_path_hf`` overrides the registry default, so a
+    # deployment can serve a LOCAL fine-tuned checkpoint directory instead of the
+    # stock HF repo. ``_resolve_model_metadata`` already accepts a local path;
+    # without this override there was no way to reach it. Popped rather than
+    # forwarded because it is also passed explicitly below (duplicate keyword).
+    yaml_model_kwargs = dict(yaml_model_kwargs)
+    model_path_hf = yaml_model_kwargs.pop("model_path_hf", None) or HF_MODELS.get(model_name, {}).get(
+        "model_path_hf", ""
+    )
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+        model_path_hf=model_path_hf,
         cache_dir=cache_dir,
         **yaml_model_kwargs,
     )
@@ -943,8 +952,14 @@ def main(argv: list[str] | None = None):
      # Create a lightweight model instance for prompt processing
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
+    # Same override as the conductor-side construction above — the two model
+    # instances must resolve to the same weights or they silently diverge.
+    yaml_model_kwargs = dict(yaml_model_kwargs)
+    model_path_hf = yaml_model_kwargs.pop("model_path_hf", None) or HF_MODELS.get(model_name, {}).get(
+        "model_path_hf", ""
+    )
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+        model_path_hf=model_path_hf,
         cache_dir=args.cache_dir,
         **yaml_model_kwargs,
     )

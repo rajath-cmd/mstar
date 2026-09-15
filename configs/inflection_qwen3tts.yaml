@@ -1,0 +1,26 @@
+# Inflection Qwen3-TTS deployment: our fine-tuned CustomVoice checkpoint.
+#
+# Differs from configs/qwen3tts.yaml only in pointing model_path_hf at a local
+# directory. The stock config serves Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice from
+# the Hub, which is HEADLESS (no pointer_head.pt) and so returns no word
+# timestamps — benchmarking timestamp work against it measures nothing.
+model: "qwen3_tts"
+max_seq_len: 32768
+
+model_kwargs:
+  # Local checkpoint dir. _resolve_model_metadata treats an existing path as a
+  # local snapshot and skips the Hub entirely.
+  model_path_hf: "/mnt/data/models/audio/tts/qwen3-tts/sft-cv-13l-14pv-ticr-1e-13l-fulldata_17946/checkpoint-final"
+
+# The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
+# kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+resources:
+  talker_attn:
+    flashinfer_backend: fa2
+node_groups:
+  - node_names: [Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_decode]
+  - node_names: [Codec]
+    ranks: [0]
+    graph_walks: [codec_chunk]

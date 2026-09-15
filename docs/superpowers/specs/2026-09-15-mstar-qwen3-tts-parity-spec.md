@@ -93,6 +93,63 @@ Verified by reading the fork at `ddb38a7` on 2026-09-15.
 | No serving Dockerfile | Only `mstar/integrations/dynamo/docker/*` | 7 |
 | Not installed locally | No `.venv` in the checkout | 1 |
 
+### BLOCKER: M* cannot serve our checkpoint at all (Gate 0b)
+
+Discovered by *running* the Phase 1 Task 1 gate on 2026-09-15 rather than assuming it.
+`mstar serve qwen3_tts --config configs/inflection_qwen3tts.yaml` dies during worker
+construction:
+
+```
+mstar/model/qwen3_tts/components/talker.py:236, in Qwen3TTSCodePredictor.__init__
+ValueError: M* currently requires equal Talker and CodePredictor hidden sizes;
+            the supported 0.6B checkpoint uses 1024 for both
+```
+
+**M*'s Qwen3-TTS supports only the 0.6B variant.** Our production checkpoint is the
+1.7B (`tts_model_size: "1b7"`, Talker `hidden_size=2048`, 28 layers, CodePredictor
+`hidden_size=1024`). Those dims are unequal by design in this size class, and M*
+hard-rejects that.
+
+The fix is known and bounded, because the checkpoint already carries the bridge.
+`model.safetensors` (404 tensors) contains:
+
+```
+talker.code_predictor.small_to_mtp_projection.weight   # 2048 -> 1024
+talker.code_predictor.small_to_mtp_projection.bias
+```
+
+vllm-omni's `qwen3_tts_code_predictor_vllm.py` uses exactly this: it keeps
+`codec_embedding` at the **Talker** dim (`emb_dim = talker_hidden_size`) and projects the
+Talker hidden down through `small_to_mtp_projection` before the depth loop. M* implements
+neither — it assumes one dim throughout.
+
+So the port needs a phase that did not exist in the first draft of this roadmap, and it
+comes before everything else:
+
+**Phase 0b — 1.7B support.** Load `small_to_mtp_projection`; size `codec_embedding` at the
+Talker dim; project Talker hidden → CodePredictor hidden at the depth-loop entry; drop the
+equality check. Keep the 0.6B path working — equal dims with no projection weight is the
+identity case. This is generic Qwen3-TTS support, not an Inflection customisation, and is
+the most upstreamable piece of the whole program.
+
+**Until Phase 0b lands, no measurement in this program is possible** — not parity, not
+benchmarks, not the alignment spike. Every later phase depends on it.
+
+A second consequence: the stock `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` that
+`configs/qwen3tts.yaml` points at is **headless** — no `pointer_head.pt`, so no word
+timestamps. Benchmarking timestamp work against it measures nothing; any timestamp
+measurement needs a TFA-head checkpoint.
+
+### Also fixed while getting here
+
+`mstar/api_server/entrypoint.py` hardcoded `model_path_hf` from the `HF_MODELS` registry at
+both model-construction sites, with no CLI or YAML override — so M* could serve only the
+stock Hub repo, never a local fine-tune, even though `_resolve_model_metadata` already
+accepts a local directory. A yaml `model_kwargs.model_path_hf` now overrides it (popped
+before the `**` forward, which would otherwise be a duplicate-keyword `TypeError`).
+Generic, and upstreamable alongside Phase 0b. `configs/inflection_qwen3tts.yaml` is the
+deployment config that uses it.
+
 ### The alignment seam (de-risked early, deliberately)
 
 Phase 3 is the highest-risk phase, so its feasibility was checked **before** planning
@@ -196,7 +253,8 @@ around.
 
 | Phase | Deliverable | Gate |
 |---|---|---|
-| **0** | Branch, protection, this spec, conformance-suite skeleton, golden traces from vllm-omni | Repo visibility resolved (Gate 0); M* installs and serves our checkpoint over `/generate` |
+| **0** | Branch, protection, this spec, conformance-suite skeleton, golden traces from vllm-omni | Repo visibility resolved (Gate 0) |
+| **0b** | **1.7B support**: `small_to_mtp_projection`, Talker-dim `codec_embedding`, drop the equality check | M* serves `checkpoint-final` and `/generate` returns audio. **Blocks every other phase.** |
 | **1** | `Qwen3TTSAdapter`; full `SpeechRequest`; voices endpoints; REST conformance green | REST differential suite passes L1+L2 for every non-timestamp field |
 | **2** | WS `/v1/audio/speech/stream`: session protocol, chunker, inter-chunk pause, cancel, multi-turn, audio-stall guard | WS golden-trace replay passes L1+L2 |
 | **3** | Temporal alignment: aux-layer capture, pointer head, Viterbi, streaming commit horizon, incremental emission | Spike (Task 1) proves layer-3 capture at prefill + decode; then L3 within CI on blind30 |
