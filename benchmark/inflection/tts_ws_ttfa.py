@@ -36,8 +36,26 @@ CORPUS = [
 ]
 
 
+WS_PATH = "/v1/audio/speech/stream"
+
+
 def ws_url(base: str) -> str:
-    return base.replace("http://", "ws://").replace("https://", "wss://") + "/v1/audio/speech/stream"
+    """Normalise a server address to the streaming endpoint.
+
+    Accepts an http(s) base, a ws(s) base, or either already carrying the
+    endpoint path. Appending unconditionally is the obvious implementation and
+    the wrong one: pass the full ws:// URL -- which is what anyone who has read
+    the protocol docs will reach for -- and every handshake comes back 404,
+    reported as `ALL FAILED ['InvalidStatus']` with no hint that the URL was
+    doubled.
+    """
+    url = base.strip().rstrip("/")
+    url = url.replace("https://", "wss://").replace("http://", "ws://")
+    if not url.startswith(("ws://", "wss://")):
+        url = "ws://" + url
+    if url.endswith(WS_PATH):
+        return url
+    return url + WS_PATH
 
 
 async def one_turn(url: str, text: str, voice: str, timeout: float) -> dict:
@@ -156,7 +174,7 @@ def render(out: dict, outdir: pathlib.Path) -> None:
             fig.update_xaxes(title_text="concurrency", type="log", row=row, col=col)
         fig.update_layout(title="Qwen3-TTS WebSocket: M* vs vllm-omni (TTFA = first PCM after input.done)",
                           height=800, template="plotly_white")
-        fig.write_html(str(outdir / "ttfa.html"))
+        fig.write_html(str(outdir / "ttfa.html"), include_plotlyjs="cdn")
         print(f"wrote {outdir / 'ttfa.html'}")
     except ImportError:
         print("plotly not installed — skipping HTML")

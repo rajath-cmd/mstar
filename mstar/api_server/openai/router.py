@@ -8,6 +8,7 @@ the surface is supported, and delegates to a serving handler. The native
 from __future__ import annotations
 
 import json
+import os
 
 from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -80,6 +81,33 @@ def _resolve(require: str):
     return api, api.model_name, adapter, None
 
 
+def _refresh_cross_process_gauges() -> None:
+    """Restate, in THIS process, gauges whose truth lives in the worker.
+
+    The engine runs in a separate process, so a gauge the worker sets is
+    invisible to the registry uvicorn actually scrapes -- it would read a
+    flat zero forever and look like a broken deployment rather than a
+    cross-process one. ``tts_alignment_head_loaded`` is the one that matters:
+    a dashboard uses it to explain why word-timestamp requests came back with
+    no words, so a false zero sends the reader chasing the wrong cause.
+
+    Resolved from the checkpoint on disk, which is the same fact the worker
+    acts on when it decides whether to load the head.
+    """
+    from mstar.metrics.prometheus import TTS_ALIGNMENT_HEAD_LOADED
+
+    api = _api()
+    model_dir = getattr(api, "model_path", None) or os.environ.get("MSTAR_MODEL_PATH")
+    if not model_dir:
+        return
+    try:
+        from mstar.model.qwen3_tts.temporal_alignment.load_head import find_pointer_head
+
+        TTS_ALIGNMENT_HEAD_LOADED.set(1 if find_pointer_head(model_dir) else 0)
+    except Exception:  # noqa: BLE001 — a gauge must never fail a scrape
+        return
+
+
 @router.get("/metrics")
 async def metrics():
     """Prometheus exposition. Series names are frozen to vllm-omni's so an
@@ -88,6 +116,7 @@ async def metrics():
 
     from mstar.metrics import prometheus
 
+    _refresh_cross_process_gauges()
     payload, content_type = prometheus.render()
     return Response(content=payload, media_type=content_type)
 

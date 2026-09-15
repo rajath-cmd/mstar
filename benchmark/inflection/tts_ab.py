@@ -254,7 +254,7 @@ def render(out: dict, outdir: pathlib.Path) -> None:
         fig.update_layout(title=f"Qwen3-TTS: M* vs vllm-omni — {out.get('mode', 'batch')} mode "
                                 f"(same checkpoint, interleaved arms)",
                           height=800, template="plotly_white")
-        fig.write_html(str(outdir / "tts_ab.html"))
+        fig.write_html(str(outdir / "tts_ab.html"), include_plotlyjs="cdn")
         print(f"wrote {outdir / 'tts_ab.html'}")
     except ImportError:
         print("plotly not installed — skipping HTML")
