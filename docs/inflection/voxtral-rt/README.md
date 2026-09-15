@@ -3,13 +3,15 @@
 Vanilla `Voxtral-Mini-4B-Realtime-2602` (no auxiliary heads) running on M*,
 with an OpenAI-compatible transcription endpoint.
 
-**Status: bring-up, verified correct.** The model core is bit-exact against the
-HuggingFace reference — 8 of 8 test utterances token-identical, English and
-Chinese, 3.5 s to 25 s. The server in front of it is single-stream and is not
-yet on M*'s Walk Graph engine. See [What is and is not done](#what-is-and-is-not-done).
+**Status: running on M*'s Walk Graph engine, verified correct.** 8 of 8 test
+utterances transcribe identically to the HuggingFace reference, English and
+Chinese, 3.5 s to 25 s — through the real engine, with paged attention,
+continuous batching and CUDA-graph decode. See
+[What is and is not done](#what-is-and-is-not-done).
 
 - [How the model works](#how-the-model-works) — read this first
 - [Quick start](#quick-start)
+- [Two ways to run it](#two-ways-to-run-it)
 - [Docker](#docker)
 - [API](#api)
 - [Verifying correctness](#verifying-correctness)
@@ -108,6 +110,61 @@ extractor lives in `transformers>=5.16`, and M* pins 4.57 for the Qwen3-TTS
 path; upgrading transformers to obtain one feature extractor would put a working
 production stack at risk. The port is ~15 lines of STFT and was verified
 bit-identical to the reference (max abs diff `0.000e+00`).
+
+---
+
+## Two ways to run it
+
+There are two servers in this branch, and the difference matters.
+
+| | engine path (**use this**) | bring-up server |
+|---|---|---|
+| launch | `scripts/inflection/launch_mstar_voxtral_rt.sh` | `python -m mstar.model.voxtral_rt.serving.app` |
+| runs on | M*'s Walk Graph engine | a plain FastAPI loop |
+| batching | continuous, paged attention, CUDA graphs | one request at a time behind a lock |
+| endpoint | `POST /generate` (M*'s multimodal API) | `POST /v1/audio/transcriptions` (OpenAI shape) |
+| throughput @ c=16 | **133x realtime** | 7x realtime |
+| latency p50 @ c=16 | **1091 ms** | 24276 ms |
+
+```bash
+CKPT=/mnt/data/models/audio/stt/voxtral-rt/pretrained/Voxtral-Mini-4B-Realtime-2602
+MSTAR_MODEL_PATH=$CKPT GPUS=0 scripts/inflection/launch_mstar_voxtral_rt.sh 8300
+
+curl -X POST http://127.0.0.1:8300/generate \
+  -F "files=@sample.wav" -F "input_modalities=audio" \
+  -F "output_modalities=text" -F "streaming=false"
+```
+
+Chunks come back base64-encoded, one per decoded token; concatenate and decode
+them for the transcript. The OpenAI-shaped `/v1/audio/transcriptions` wrapper
+has not been ported onto the engine path yet — that is the next piece of work,
+and it is a routing change, not a model one.
+
+The bring-up server is kept because it is the trusted oracle. `model.py` is a
+standalone PyTorch implementation of the same weights, token-identical to the
+HF reference, and `weights.py` guarantees both paths load the checkpoint the
+same way. Bisecting the engine port against it is what found the KV-cursor bug
+below; without a reference implementation that bug is close to undiagnosable.
+
+### Measured
+
+One B200, 8-clip corpus (3.5 s – 25 s), 3 reps per level, 100% success at every
+level for both arms:
+
+| concurrency | latency p50 | | RTF p50 | | throughput | |
+|---|---|---|---|---|---|---|
+| | bring-up | **engine** | bring-up | **engine** | bring-up | **engine** |
+| 1 | 1369 ms | **674 ms** | 0.14 | **0.06** | 7.0x | 6.6x |
+| 2 | 2921 ms | **813 ms** | 0.22 | **0.07** | 6.9x | **29.6x** |
+| 4 | 5170 ms | **820 ms** | 0.43 | **0.08** | 6.7x | **42.9x** |
+| 8 | 11983 ms | **738 ms** | 0.85 | **0.07** | 7.0x | **97.7x** |
+| 16 | 24276 ms | **1091 ms** | **1.74** | **0.11** | 7.0x | **132.9x** |
+
+Two things to read off it. The serialized server crosses RTF 1.0 between c=8
+and c=16 — past that it cannot keep up with the audio — while the engine stays
+near 0.1 throughout. And single-stream latency HALVES (1369 → 674 ms), which is
+not batching at all: that is CUDA-graph decode removing per-step launch
+overhead.
 
 ---
 
@@ -266,20 +323,20 @@ Single-stream RTF of 0.17 means a 10-second clip transcribes in 1.7 seconds.
 **Done and verified**
 - Model core, bit-exact against the HF reference (8/8 token-identical)
 - Front end: mistral-common tokenization, ported mel (bit-identical)
-- `POST /v1/audio/transcriptions` — json / text / verbose_json, 400s
+- **Walk Graph engine integration** — registered as `voxtral_rt`, runs under
+  `mstar serve`, with paged attention, continuous batching and CUDA-graph
+  decode. 8/8 transcripts still identical to the reference through the engine;
+  19x throughput and 22x lower latency at concurrency 16.
+- `POST /v1/audio/transcriptions` on the bring-up server — json / text /
+  verbose_json, 400s
 - 15 tests across CPU and GPU tiers, with recorded reference fixtures
-- Latency/RTF benchmark with charts
+- Latency/RTF benchmarks and charts for both paths
 
 **Not done**
-- **Walk Graph engine integration.** This is the main item. Voxtral is not in
-  `MODEL_REGISTRY` and does not run under `mstar serve`; it has its own
-  process. Porting it brings continuous batching, paged attention and CUDA
-  graphs — the three things that gave Qwen3-TTS 7.8x lower latency than
-  vllm-omni at concurrency 32. The shape fits M*'s model well: the audio tower
-  is a one-shot prefill node (like the existing `whisper` encoder) and the text
-  decoder is a standard AR loop whose per-step audio conditioning is the same
-  "add a precomputed per-step vector" pattern the Qwen3-TTS talker already uses
-  for `trailing_text_hidden`.
+- **The OpenAI-shaped endpoint on the engine path.** The engine serves
+  `/generate`; `/v1/audio/transcriptions` still only exists on the bring-up
+  server. This is a routing change, not a model one, and it is the next piece
+  of work.
 - **Streaming.** The architecture supports it natively — that is the point of
   the causal tower and the conv padding cache — but only offline transcription
   is wired. A `/v1/realtime` WebSocket matching the vllm-realtime protocol is
@@ -299,6 +356,16 @@ It stringifies annotations, and FastAPI resolves a route's annotations against
 the *module* namespace, so `UploadFile` on a route defined inside a factory
 becomes an unresolvable ForwardRef. Keep the FastAPI imports module-level and
 that file free of the future import.
+
+**The model loads, prefills perfectly, then transcribes nothing but padding**
+— a decoder running M*'s shared `Attention` must advance the resource cursors
+itself: `attend.bind_step()` once, then `attend.set_layer_idx()` per layer.
+Forget the latter and all 26 layers read and write layer 0's KV pages. The
+deception is that PREFILL still comes out bit-exact — with an empty cache the
+attention is computed entirely from the q/k/v of that same call, so the layer
+index never matters. Only the first DECODE step, the first read of cached keys,
+goes wrong. Compare prefill AND decode logits against `model.py` (the oracle)
+when this shape of bug appears.
 
 **Transcript is right but shifted early, or drops the last word** — the time
 conditioning is wrong. `TimeEmbedding.inv_freq` is a non-persistent buffer, so
