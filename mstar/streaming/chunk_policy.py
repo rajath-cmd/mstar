@@ -100,6 +100,23 @@ class LeftContextChunkPolicy(ChunkPolicy):
 
     def __init__(self, chunk: int, left_context: int):
         super().__init__()
+        # The first-pop invariant above advances by ``chunk - left_context``,
+        # which is only a forward advance when chunk > left_context. With
+        # chunk <= left_context it goes backwards (chunk=1, ctx=25 advances by
+        # -24) and the stream silently loses its opening: measured on Qwen3-TTS,
+        # a 6.08 s utterance came back as 4.64 s with the first ~18 frames gone,
+        # transcribing as "lazy dog while the morning light..." instead of "The
+        # quick brown fox jumps over the lazy dog while...". Truncated audio that
+        # still sounds fluent is the worst possible failure here, so reject the
+        # configuration rather than produce it.
+        if chunk <= left_context:
+            raise ValueError(
+                f"LeftContextChunkPolicy requires chunk > left_context, got "
+                f"chunk={chunk}, left_context={left_context}. The first pop "
+                f"advances by chunk - left_context ({chunk - left_context}), so "
+                f"this config drops the start of every stream. For lower latency "
+                f"reduce BOTH (e.g. chunk=4, left_context=2)."
+            )
         self._chunk = chunk
         self._left_context = left_context
         self._window = chunk + left_context

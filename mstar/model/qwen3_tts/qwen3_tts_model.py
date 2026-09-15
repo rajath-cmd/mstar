@@ -198,6 +198,23 @@ class Qwen3TTSModel(Model):
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3TTSModelConfig.from_pretrained(self.local_dir)
+
+        # Codec streaming cadence, overridable per deployment.
+        #
+        # ``chunk_frames`` is how many 12.5 Hz codec frames the Codec node waits
+        # for before it decodes and emits any audio, so it IS the time-to-first-
+        # audio floor: the checkpoint default of 300 frames is 300 x 80 ms = 24 s
+        # of audio buffered before the first PCM byte leaves the server. That is
+        # fine for batch throughput and fatal for a voice agent — measured 395 ms
+        # TTFA against vllm-omni's 39 ms, which streams one frame at a time.
+        #
+        # It was previously readable only from the checkpoint's
+        # speech_tokenizer/config.json, so no deployment could tune it. Accepting
+        # it as a model kwarg is what makes a low-latency profile expressible.
+        for name in ("codec_chunk_frames", "codec_left_context_frames"):
+            value = kwargs.pop(name, None)
+            if value is not None:
+                setattr(self.config.codec, name.removeprefix("codec_"), int(value))
         if self.config.tts_model_type != "custom_voice":
             raise ValueError(
                 "The first Qwen3-TTS integration supports only CustomVoice "

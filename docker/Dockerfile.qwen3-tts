@@ -1,0 +1,93 @@
+# Qwen3-TTS serving image — a drop-in replacement for the vllm-omni TTS image.
+#
+# Build from the repository root:
+#
+#   docker build -f docker/Dockerfile.qwen3-tts -t inflection/qwen3-tts-mstar:latest .
+#
+# It layers on the `serve` stage of the Dynamo Dockerfile rather than repeating
+# the CUDA/torch/flash-attn pinning, so there is exactly one place those
+# versions live. Build args pass straight through — see that file for the
+# CUDA 13 override triplet.
+#
+# Weights are NOT baked in. Mount a checkpoint and point $MSTAR_MODEL_PATH at
+# it, so one image serves any Qwen3-TTS fine-tune:
+#
+#   docker run -d --name qwen3-tts --gpus '"device=0"' --ipc=host -p 8100:8100 \
+#     -v /path/to/checkpoint-final:/checkpoint:ro \
+#     -e MSTAR_MODEL_PATH=/checkpoint \
+#     inflection/qwen3-tts-mstar:latest
+#
+# The checkpoint directory needs config.json, generation_config.json,
+# model.safetensors and speech_tokenizer/config.json. A pointer_head.pt beside
+# them enables word timestamps (Phase 3; not yet consumed by M*).
+#
+# Profiles (MSTAR_TTS_CONFIG):
+#   configs/inflection_qwen3tts_lowlatency.yaml  (default here) — voice agents.
+#       codec_chunk_frames=1: audio leaves after every 80 ms frame.
+#   configs/inflection_qwen3tts.yaml — batch/offline. The checkpoint's stock
+#       codec_chunk_frames=300 buffers 24 s before the first byte: higher
+#       throughput, unusable TTFA.
+
+ARG CUDA_IMAGE=docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+FROM ${CUDA_IMAGE} AS cuda-base
+FROM cuda-base AS qwen3-tts
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_VERSION=2.9.1
+ARG TORCHVISION_VERSION=0.24.1
+ARG TORCHAUDIO_VERSION=2.9.1
+ARG TORCHCODEC_VERSION=0.9.1
+ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+RUN uv venv --python 3.12 --seed /opt/mstar/venv \
+    && uv pip install --python /opt/mstar/venv/bin/python \
+        --index-url ${TORCH_INDEX} \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+    && uv pip install --python /opt/mstar/venv/bin/python ${FLASH_ATTN_WHEEL}
+
+WORKDIR /opt/mstar/src
+COPY . .
+
+RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+        torchcodec==${TORCHCODEC_VERSION}
+
+# The venv MUST lead PATH. FlashInfer JIT-compiles attention kernels and shells
+# out to `ninja` via a PATH lookup at request time; without this the server logs
+# "FileNotFoundError: ninja" on every capture and never binds.
+ENV PATH=/opt/mstar/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    HF_TOKEN_PATH=/dev/null \
+    MSTAR_MODEL_PATH=/checkpoint \
+    MSTAR_TTS_CONFIG=/opt/mstar/src/configs/inflection_qwen3tts_lowlatency.yaml \
+    MSTAR_TTS_PORT=8100 \
+    MSTAR_TTS_GPUS=0
+
+# Fail fast and legibly rather than deep inside worker startup.
+RUN python -c "import mstar, torch; print('mstar ok, torch', torch.__version__)" \
+    && python -c "from mstar.api_server.openai.adapters import get_adapter; \
+assert get_adapter('qwen3_tts') is not None, 'qwen3_tts adapter not registered'; \
+print('qwen3_tts adapter ok')" \
+    && python -c "import mstar.api_server.openai.serving_speech_stream as m; \
+assert hasattr(m, 'SpeechStreamHandler'); print('ws handler ok')"
+
+EXPOSE 8100
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=420s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:${MSTAR_TTS_PORT}/health || exit 1
+
+COPY docker/qwen3-tts-entrypoint.sh /usr/local/bin/qwen3-tts-entrypoint.sh
+RUN chmod +x /usr/local/bin/qwen3-tts-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/qwen3-tts-entrypoint.sh"]

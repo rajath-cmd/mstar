@@ -1,0 +1,38 @@
+# Inflection Qwen3-TTS — LOW-LATENCY profile (voice agents, barge-in).
+#
+# Identical to configs/inflection_qwen3tts.yaml except for codec streaming
+# cadence, which is the whole time-to-first-audio story.
+#
+# The checkpoint ships chunk_frames=300. At 12.5 Hz that is 300 x 80 ms = 24 s
+# of audio buffered before the Codec node emits ANY PCM, so short replies finish
+# generating before a single byte leaves the server. Measured TTFA on the stock
+# value: 395 ms p50 at concurrency 1, against vllm-omni's 39 ms — a 10x loss on
+# the one metric a voice agent feels.
+#
+# vllm-omni streams codec_chunk_frames=1 with codec_left_context_frames=25;
+# this profile matches it. Lower chunk_frames means more, smaller decoder
+# invocations — pure throughput drops somewhat, which is the trade a realtime
+# deployment wants and a batch deployment does not. Use the batch config for
+# offline synthesis.
+#
+# Weights: set $MSTAR_MODEL_PATH (see _resolve_model_path in entrypoint.py).
+model: "qwen3_tts"
+max_seq_len: 32768
+
+model_kwargs:
+  # Emit after every codec frame (80 ms of audio) instead of every 300.
+  codec_chunk_frames: 1
+  # Overlap carried into each decode so chunk seams do not click. Matches
+  # vllm-omni's codec_left_context_frames.
+  codec_left_context_frames: 25
+
+resources:
+  talker_attn:
+    flashinfer_backend: fa2
+node_groups:
+  - node_names: [Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_decode]
+  - node_names: [Codec]
+    ranks: [0]
+    graph_walks: [codec_chunk]

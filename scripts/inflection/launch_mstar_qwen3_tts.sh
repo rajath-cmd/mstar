@@ -17,6 +17,10 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 REPO="$PWD"
 
+# CONFIG selects the deployment profile: the default is tuned for batch
+# throughput, inflection_qwen3tts_lowlatency.yaml for voice agents (see the
+# codec_chunk_frames note in that file).
+CONFIG="${CONFIG:-$REPO/configs/inflection_qwen3tts.yaml}"
 PORT="${1:-${PORT:-8100}}"
 GPUS="${GPUS:-0}"
 LOG="${LOG:-$REPO/logs/mstar-$PORT.log}"
@@ -39,9 +43,10 @@ export MSTAR_MODEL_PATH
 
 echo "model : $MSTAR_MODEL_PATH"
 echo "port  : $PORT   gpus: $GPUS"
+echo "config: $CONFIG"
 echo "log   : $LOG"
 
 exec "$REPO/.venv/bin/mstar" serve qwen3_tts \
-    --config "$REPO/configs/inflection_qwen3tts.yaml" \
+    --config "$CONFIG" \
     --gpus "$GPUS" --host 0.0.0.0 --port "$PORT" \
     --log-level INFO >"$LOG" 2>&1

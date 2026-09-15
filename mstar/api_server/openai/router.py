@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mstar.api_server.openai import (
     serving_chat,
     serving_images,
     serving_speech,
+    serving_speech_stream,
     serving_videos,
     serving_voices,
 )
@@ -112,6 +113,21 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+
+
+@router.websocket("/v1/audio/speech/stream")
+async def audio_speech_stream(websocket: WebSocket):
+    """Streaming text-input TTS. Protocol frozen to vllm-omni's — see
+    serving_speech_stream. Accepts before resolving the model so a client gets a
+    protocol-level `error` frame rather than an opaque handshake failure."""
+    api = _api()
+    if api is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "message": "Server not ready"})
+        await websocket.close()
+        return
+    handler = serving_speech_stream.SpeechStreamHandler(api)
+    await handler.handle_session(websocket)
 
 
 @router.get("/v1/audio/voices")
