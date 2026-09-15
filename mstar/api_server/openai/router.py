@@ -80,6 +80,18 @@ def _resolve(require: str):
     return api, api.model_name, adapter, None
 
 
+@router.get("/metrics")
+async def metrics():
+    """Prometheus exposition. Series names are frozen to vllm-omni's so an
+    existing dashboard or alert keeps working across a backend swap."""
+    from fastapi.responses import Response
+
+    from mstar.metrics import prometheus
+
+    payload, content_type = prometheus.render()
+    return Response(content=payload, media_type=content_type)
+
+
 @router.get("/v1/models")
 async def list_models():
     api = _api()

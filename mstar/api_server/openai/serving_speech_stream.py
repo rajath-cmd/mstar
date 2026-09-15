@@ -43,11 +43,24 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from mstar.api_server.openai._util import rid
 from mstar.api_server.openai.text_chunker import create_chunker
+from mstar.metrics.prometheus import (
+    TTS_ACTIVE_REQUESTS,
+    TTS_AUDIO_DURATION_SECONDS,
+    TTS_CANCEL_TOTAL,
+    TTS_GENERATION_SECONDS,
+    TTS_REQUESTS_TOTAL,
+    TTS_RTF,
+    TTS_STREAMING_SENTENCES,
+    TTS_STREAMING_SESSIONS,
+    TTS_TTFA_SECONDS,
+    WS_CLOSE_REASONS_TOTAL,
+)
 
 # Native PCM rate produced by the Qwen3-TTS codec. Used to size the inter-chunk
 # silence when the session sets no explicit sample_rate.
@@ -163,6 +176,8 @@ class SpeechStreamHandler:
 
     async def handle_session(self, websocket: WebSocket) -> None:
         await websocket.accept()
+        TTS_STREAMING_SESSIONS.inc()
+        close_reason = "client_disconnect"
         ws_lock = asyncio.Lock()
         worker_task: asyncio.Task | None = None
 
@@ -200,6 +215,7 @@ class SpeechStreamHandler:
                     if isinstance(item, tuple) and item and item[0] is _CANCEL_ACK:
                         _, drained, prior_idx = item
                         await send_json({"type": "cancelled", "sentence_index": prior_idx, "drained": drained})
+                        TTS_CANCEL_TOTAL.inc()
                         first_chunk_of_turn = True
                         turn_audio_s = 0.0
                         sentence_index = 0
@@ -210,6 +226,7 @@ class SpeechStreamHandler:
 
                     if item is _INPUT_DONE:
                         await send_json({"type": "session.done", "total_sentences": sentence_index})
+                        TTS_STREAMING_SENTENCES.observe(sentence_index)
                         sentence_index = 0
                         first_chunk_of_turn = True
                         turn_audio_s = 0.0
@@ -324,8 +341,11 @@ class SpeechStreamHandler:
             pass
         except Exception as e:  # noqa: BLE001
             if "close message has been sent" not in str(e):
+                close_reason = "internal_error"
                 await send_error(f"Internal error: {e}")
         finally:
+            TTS_STREAMING_SESSIONS.dec()
+            WS_CLOSE_REASONS_TOTAL.labels(reason=close_reason).inc()
             if worker_task is not None and not worker_task.done():
                 worker_task.cancel()
                 with contextlib.suppress(Exception):
@@ -402,6 +422,11 @@ class SpeechStreamHandler:
         model_bytes = 0
         request_id = rid(f"speech-ws-{sentence_index}")
         cap_s = runaway_cap_seconds(text)
+        voice = str(config.get("voice") or "")
+        t_start = time.perf_counter()
+        t_first_pcm: float | None = None
+        TTS_ACTIVE_REQUESTS.inc()
+        TTS_REQUESTS_TOTAL.labels(endpoint="stream", voice=voice, status="started").inc()
 
         if leading_silence:
             async with ws_lock:
@@ -425,6 +450,12 @@ class SpeechStreamHandler:
                     continue
                 async with ws_lock:
                     await websocket.send_bytes(chunk.data)
+                if t_first_pcm is None:
+                    t_first_pcm = time.perf_counter()
+                    # TTFA is measured to the first PCM, never to audio.start:
+                    # that control frame carries no audio, and timing it would
+                    # understate the number by the whole synthesis time.
+                    TTS_TTFA_SECONDS.observe(t_first_pcm - t_start)
                 model_bytes += len(chunk.data)
                 chunk_count += 1
                 # Runaway early-stop. Without it a repetition loop streams
@@ -432,6 +463,17 @@ class SpeechStreamHandler:
                 if cap_s is not None and model_bytes >= cap_s * sample_rate * 2:
                     break
         finally:
+            TTS_ACTIVE_REQUESTS.dec()
+            elapsed = time.perf_counter() - t_start
+            audio_s = model_bytes / 2 / sample_rate if sample_rate else 0.0
+            TTS_GENERATION_SECONDS.observe(elapsed)
+            if audio_s > 0:
+                TTS_AUDIO_DURATION_SECONDS.observe(audio_s)
+                TTS_RTF.observe(elapsed / audio_s)
+            TTS_REQUESTS_TOTAL.labels(
+                endpoint="stream", voice=voice,
+                status="cancelled" if cancel_event.is_set() else "success",
+            ).inc()
             if cancel_event.is_set():
                 with contextlib.suppress(Exception):
                     self._api.abort_request(request_id)
