@@ -83,6 +83,13 @@ async def _level(url: str, clips: list[tuple[str, float]], conc: int, reps: int)
         "latency_p50_ms": round(statistics.median(lat) * 1000, 1),
         "latency_p90_ms": round(lat[int(0.9 * (len(lat) - 1))] * 1000, 1),
         "rtf_p50": round(statistics.median(r["rtf"] for r in good), 4),
+        # Raw per-request values so any percentile can be recomputed without
+        # re-running the sweep.
+        "samples": {
+            "latency_ms": [r["latency"] * 1000 for r in good],
+            "rtf": [r["rtf"] for r in good],
+            "audio_s": [r["audio_s"] for r in good],
+        },
         # Aggregate throughput uses the LEVEL's wall clock, not the sum of
         # per-request times: summing would count overlapped work twice and
         # report a throughput the server never achieved.
