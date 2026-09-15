@@ -29,9 +29,28 @@ class TimeEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10_000.0):
         super().__init__()
-        half = dim // 2
-        inv_freq = torch.exp(-math.log(theta) * torch.arange(half).float() / half)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+        self.theta = theta
+        self.register_buffer("inv_freq", self._build(), persistent=False)
+
+    def _build(self) -> torch.Tensor:
+        half = self.dim // 2
+        return torch.exp(
+            -math.log(self.theta) * torch.arange(half).float() / half
+        )
+
+    def reset_buffer(self, device, dtype) -> None:
+        """Recompute inv_freq in place.
+
+        Needed because loading materialises the module with ``to_empty()``,
+        which allocates storage for buffers WITHOUT initialising it -- and
+        ``inv_freq`` is non-persistent, so no checkpoint key ever overwrites
+        the garbage. The result is not a crash: the delay conditioning is
+        computed from noise, and the model transcribes the right words at the
+        wrong times, emitting them a couple of frames early. Every
+        missing-weight check passes, because nothing is missing.
+        """
+        self.inv_freq = self._build().to(device=device, dtype=dtype)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         emb = t * self.inv_freq.to(device=t.device, dtype=t.dtype)

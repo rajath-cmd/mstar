@@ -138,6 +138,10 @@ class VoxtralRealtime(nn.Module):
 
         model.eval()
         model._model_dir = str(model_dir)
+        # to_empty() above allocated buffer storage without initialising it,
+        # and non-persistent buffers are by definition absent from the
+        # checkpoint, so they must be rebuilt explicitly here.
+        model.time_embedding.reset_buffer(device=device, dtype=dtype)
         model.prepare_time_conditioning(cfg.default_num_delay_tokens)
         return model
 
