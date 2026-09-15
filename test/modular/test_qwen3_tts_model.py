@@ -942,10 +942,43 @@ def test_qwen3_tts_streaming_policy_flushes_only_new_tail_audio():
 
     codec = CodecSubmodule(_FakeCodecDecoder(4), config)
     state = codec.request_state("request")
-    state.add_all(latest_codec_frames=4, codec_chunk_emitted=True)
+    # The overlap to trim is derived from frames already EMITTED, not from a
+    # "has emitted once" flag: under the growing-context policy the overlap
+    # starts at 0 and rises to left_context_frames over the first chunks, so a
+    # boolean would over-trim every chunk in between.
+    state.add_all(latest_codec_frames=4, codec_frames_emitted=8)
     outputs = {"audio_chunk": [torch.arange(16)]}
     codec.postprocess("request", None, outputs)
     assert outputs["audio_chunk"][0].tolist() == list(range(8, 16))
+
+
+def test_qwen3_tts_codec_trims_nothing_on_the_very_first_chunk():
+    """Nothing has been emitted yet, so every decoded sample is new."""
+    config = _tiny_model_config()
+    config.codec.left_context_frames = 2
+    codec = CodecSubmodule(_FakeCodecDecoder(4), config)
+    state = codec.request_state("request")
+    state.add_all(latest_codec_frames=2, codec_frames_emitted=0)
+    outputs = {"audio_chunk": [torch.arange(8)]}
+    codec.postprocess("request", None, outputs)
+    assert outputs["audio_chunk"][0].tolist() == list(range(8))
+    # And the running total advances by what was actually emitted.
+    assert int(state.get("codec_frames_emitted", 0)) == 2
+
+
+def test_qwen3_tts_codec_trims_only_the_context_that_exists():
+    """Overlap is capped by history, so a growing context trims correctly."""
+    config = _tiny_model_config()
+    config.codec.left_context_frames = 4
+    codec = CodecSubmodule(_FakeCodecDecoder(4), config)
+    state = codec.request_state("request")
+    # Only 1 frame has been emitted so far: the window carries 1 context frame,
+    # not the configured 4.
+    state.add_all(latest_codec_frames=3, codec_frames_emitted=1)
+    outputs = {"audio_chunk": [torch.arange(12)]}
+    codec.postprocess("request", None, outputs)
+    assert outputs["audio_chunk"][0].tolist() == list(range(4, 12))
+    assert int(state.get("codec_frames_emitted", 0)) == 3
 
 
 def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():

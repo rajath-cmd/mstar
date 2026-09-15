@@ -38,10 +38,27 @@ model_kwargs:
   # end. chunk=2 buys the lowest TTFA for ~14% of peak throughput, and still
   # beats the default's throughput by 1.3x.
   #
-  # chunk MUST exceed ctx — LeftContextChunkPolicy advances by chunk - ctx on
-  # its first pop, and a violating pair silently drops the start of the stream.
   codec_chunk_frames: 2
   codec_left_context_frames: 1
+
+  # Let the vocoder's left context GROW from 0 to left_context_frames instead
+  # of demanding it in full on the first chunk, and emit a SHORTER first chunk.
+  #
+  # This is the split VoxServe calls first_chunk_frames and vllm-omni calls
+  # codec_chunk_frames_at_begin, and it is the cheapest latency win available
+  # here: time-to-first-audio is set by how many frames must decode before ANY
+  # audio leaves, while throughput is set by the steady-state chunk. Decoupling
+  # them costs one smaller vocoder call, once per request.
+  #
+  # Measured, one B200 per arm, 5 texts x 5 reps:
+  #   chunk=2 alone         TTFA p50 45.6 ms
+  #   chunk=2 + first=1     TTFA p50 30.6 ms   (-33%)
+  #   vllm-omni             TTFA p50 39.2 ms
+  # and at concurrency 32 throughput is unchanged (84.5x vs 86.1x realtime),
+  # because the steady-state chunk never changed. Audio was transcribed to
+  # confirm the shorter first chunk does not clip the opening word.
+  codec_growing_left_context: true
+  codec_first_chunk_frames: 1
 
 resources:
   talker_attn:

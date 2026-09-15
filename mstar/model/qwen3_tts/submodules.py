@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -1067,6 +1069,11 @@ class CodecSubmodule(ARNodeSubmodule):
         self.request_state(fwd_info.request_id).add(
             "latest_codec_frames", original_frames
         )
+        if os.environ.get("MSTAR_CODEC_DEBUG"):
+            logging.getLogger(__name__).warning(
+                "CODEC_DEBUG %s frames=%d full_seq_len=%d",
+                fwd_info.request_id, original_frames, self.full_seq_len,
+            )
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes.t().contiguous()},
         )
@@ -1127,13 +1134,22 @@ class CodecSubmodule(ARNodeSubmodule):
             return
         state = self.request_state(request_id)
         frames = int(state.get("latest_codec_frames", 0))
-        emitted = bool(state.get("codec_chunk_emitted", False))
-        # The first chunk has no overlap. Later stream chunks include old codec
-        # frames at the front, whose decoded samples must not be emitted twice.
-        left_context = self.config.codec.left_context_frames if emitted else 0
-        start = left_context * self.total_upsample
+        emitted_frames = int(state.get("codec_frames_emitted", 0))
+        # Codec frames at the FRONT of this window are ones the vocoder has
+        # already turned into emitted audio; they are re-fed only to warm its
+        # causal state, and their samples must not go out twice.
+        #
+        # Derive that count from what has actually been emitted rather than
+        # from a first-chunk flag. Under the growing-context policy the
+        # overlap starts at 0 and rises to left_context_frames over the first
+        # few chunks, so a flag that says "0 on chunk one, full thereafter"
+        # would over-trim every chunk in between -- silently deleting audio
+        # from the start of the stream while it still sounded fluent.
+        overlap = min(self.config.codec.left_context_frames, emitted_frames)
+        start = overlap * self.total_upsample
         end = frames * self.total_upsample
         outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
+        state.add("codec_frames_emitted", emitted_frames + max(0, frames - overlap))
         state.add("codec_chunk_emitted", True)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:

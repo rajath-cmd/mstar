@@ -187,6 +187,20 @@ class Qwen3TTSCodecConfig:
     # M* stream policy: 300 new 12 Hz frames with 25 frames of overlap.
     chunk_frames: int = 300
     left_context_frames: int = 25
+    # Let the vocoder's left context GROW from nothing to
+    # ``left_context_frames`` instead of demanding it in full on the first
+    # chunk. This is what vllm-omni's chunked_decode does, and it is the only
+    # way to express chunk_frames=1: the non-growing policy must advance by
+    # chunk - left_context on its first pop, so it requires
+    # chunk > left_context, and chunk=1 leaves left_context=0 as the only legal
+    # value -- a configuration that emits no audio at all.
+    growing_left_context: bool = False
+    # Frames in the FIRST emitted chunk. ``None`` means "same as
+    # chunk_frames". Lowering it cuts time-to-first-audio without touching
+    # steady-state throughput -- TTFA is set by how many frames must decode
+    # before any audio leaves, throughput by the steady-state chunk. Requires
+    # growing_left_context, which is what makes a short first window legal.
+    first_chunk_frames: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3TTSCodecConfig":
@@ -215,6 +229,8 @@ class Qwen3TTSCodecConfig:
             "decode_upsample_rate",
             "chunk_frames",
             "left_context_frames",
+            "growing_left_context",
+            "first_chunk_frames",
         }
         return {
             name: getattr(self, name)
