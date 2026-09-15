@@ -17,6 +17,7 @@ from mstar.api_server.openai import (
     serving_images,
     serving_speech,
     serving_videos,
+    serving_voices,
 )
 from mstar.api_server.openai._util import now
 from mstar.api_server.openai.adapters import get_adapter
@@ -106,6 +107,17 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+
+
+@router.get("/v1/audio/voices")
+async def audio_voices():
+    """Speaker list. Available whenever a model is loaded — a client calls this
+    before /v1/audio/speech to pick a valid ``voice``, so it must not require
+    the speech adapter that endpoint resolves."""
+    api = _api()
+    if api is None:
+        return _error(503, "Server not ready", "server_error")
+    return await serving_voices.list_voices(api)
 
 
 @router.post("/v1/images/generations")

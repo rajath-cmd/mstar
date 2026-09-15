@@ -451,9 +451,62 @@ class Wan22Adapter(OpenAIAdapter):
 
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
+class Qwen3TTSAdapter(OpenAIAdapter):
+    """Qwen3-TTS: text in, audio out.
+
+    Unlike Qwen3-Omni — a chat model whose spoken reply happens to be audio —
+    Qwen3-TTS is a dedicated TTS model: ``input`` is the script to voice and the
+    only output modality is audio.
+
+    The mapping is frozen to vllm-omni's so an M* server is a drop-in
+    replacement. Two rules matter:
+
+    * Unset fields are OMITTED, never forwarded as ``None``. The Walk Graph
+      treats a present key as an override, so a null would clobber the
+      checkpoint's own default.
+    * Talker sampling is namespaced (``talker_temperature`` / ``talker_top_p``)
+      to match the Qwen3-Omni convention already in this file, while the
+      non-OpenAI knobs keep their plain names because that is what the
+      Qwen3-TTS preprocessor reads.
+    """
+
+    supports_speech = True
+
+    # Forwarded verbatim when set. ``speed`` is included because Qwen3-TTS
+    # honours it at synthesis rather than as a post-hoc resample.
+    _DIRECT_FIELDS = (
+        "voice", "instructions", "language", "task_type", "top_k",
+        "repetition_penalty", "max_new_tokens", "timestamp_type",
+        "ref_audio", "ref_text", "x_vector_only_mode", "speed",
+    )
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        for name in self._DIRECT_FIELDS:
+            value = getattr(req, name, None)
+            if value is not None:
+                mk.setdefault(name, value)
+        _apply_sampling(
+            req, mk,
+            temperature_key="talker_temperature",
+            top_p_key="talker_top_p",
+            max_tokens_key=None,
+        )
+        # A list ``input`` is fanned out by the handler, which calls this once
+        # per item with a scalar; guard so a stray list cannot reach the engine.
+        text = req.input if isinstance(req.input, str) else None
+        return SubmitArgs(
+            text=text,
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
+    "qwen3_tts": Qwen3TTSAdapter(),
     "orpheus": OrpheusAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),

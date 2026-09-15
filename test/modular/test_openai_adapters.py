@@ -134,3 +134,67 @@ def test_registry():
     assert {"bagel", "qwen3_omni", "orpheus"} <= set(adapters.ADAPTER_REGISTRY)
     assert adapters.get_adapter("pi05") is None
     assert adapters.get_adapter("bagel").supports_chat
+
+
+# --- Qwen3-TTS ---------------------------------------------------------------
+# The request schema and adapter mapping are frozen to vllm-omni's so an
+# M*-served Qwen3-TTS is a drop-in replacement. These are the CPU-checkable half
+# of the parity contract; the live differential suite is test/parity/.
+
+
+def test_qwen3_tts_adapter_is_registered():
+    """qwen3_tts was absent from ADAPTER_REGISTRY, so /v1/audio/speech 404'd for
+    it and the base speech_to_request raised NotImplementedError."""
+    assert adapters.get_adapter("qwen3_tts") is not None
+
+
+def test_speech_request_accepts_the_full_qwen3_tts_surface():
+    req = SpeechRequest(
+        input="hi", model="qwen3_tts", voice="alexandra",
+        instructions="Speak calmly.", response_format="wav", speed=1.0,
+        stream_format="audio", task_type="CustomVoice", language="Auto",
+        ref_audio=None, ref_text=None, x_vector_only_mode=False,
+        max_new_tokens=512, stream=False, temperature=0.7, top_k=30,
+        top_p=0.95, repetition_penalty=1.05, timestamp_type="word",
+    )
+    assert req.top_k == 30
+    assert req.repetition_penalty == 1.05
+    assert req.timestamp_type == "word"
+    assert req.task_type == "CustomVoice"
+
+
+def test_speech_request_accepts_a_batch_input():
+    assert SpeechRequest(input=["a", "b"], voice="alexandra").input == ["a", "b"]
+
+
+def test_qwen3_tts_speech_maps_the_full_surface(tmp_path):
+    req = SpeechRequest(
+        input="Hello there.", model="qwen3_tts", voice="alexandra",
+        language="Auto", instructions="Speak calmly.", task_type="CustomVoice",
+        temperature=0.7, top_k=30, top_p=0.95, repetition_penalty=1.05,
+        max_new_tokens=512, timestamp_type="word",
+    )
+    sa = adapters.get_adapter("qwen3_tts").speech_to_request(req, tmp_path)
+    assert sa.text == "Hello there."
+    assert sa.input_modalities == ["text"]
+    assert sa.output_modalities == ["audio"]
+    mk = sa.model_kwargs
+    assert mk["voice"] == "alexandra"
+    assert mk["language"] == "Auto"
+    assert mk["instructions"] == "Speak calmly."
+    assert mk["task_type"] == "CustomVoice"
+    assert mk["top_k"] == 30
+    assert mk["repetition_penalty"] == 1.05
+    assert mk["timestamp_type"] == "word"
+    # Talker sampling is namespaced, matching the Qwen3-Omni convention.
+    assert mk["talker_temperature"] == 0.7
+    assert mk["talker_top_p"] == 0.95
+
+
+def test_qwen3_tts_omits_unset_fields(tmp_path):
+    """An unset field must not reach model_kwargs as None: the Walk Graph treats
+    a present key as an override, so a null clobbers the checkpoint default."""
+    req = SpeechRequest(input="Hi.", voice="alexandra")
+    mk = adapters.get_adapter("qwen3_tts").speech_to_request(req, tmp_path).model_kwargs
+    for absent in ("instructions", "language", "top_k", "repetition_penalty", "timestamp_type"):
+        assert absent not in mk, f"{absent} leaked into model_kwargs as None"

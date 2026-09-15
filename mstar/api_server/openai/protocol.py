@@ -8,7 +8,7 @@ built as plain dicts in the serving handlers to keep the multimodal shapes
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -43,19 +43,40 @@ class ChatCompletionRequest(BaseModel):
 
 
 class SpeechRequest(BaseModel):
-    """OpenAI ``/v1/audio/speech`` (text-to-speech)."""
+    """OpenAI ``/v1/audio/speech`` (text-to-speech).
+
+    The field set is frozen to vllm-omni's ``OpenAICreateSpeechRequest`` so an
+    M*-served Qwen3-TTS is a drop-in replacement for that server. Fields beyond
+    the OpenAI standard (``top_k``, ``repetition_penalty``, ``task_type``, the
+    voice-clone trio, ``timestamp_type``) belong to Qwen3-TTS and are ignored by
+    adapters that do not map them.
+
+    ``sample_rate`` is deliberately absent: it is a WebSocket session field in
+    that protocol, not a REST one.
+    """
 
     model_config = _CFG
 
-    input: str
+    input: str | list[str]
     model: str | None = None
     voice: str | None = None
-    response_format: str = "wav"
+    instructions: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = 1.0
+    stream_format: Literal["sse", "audio"] | None = "audio"
+    task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
+    language: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    x_vector_only_mode: bool | None = None
+    max_new_tokens: int | None = None
     stream: bool | None = False
     temperature: float | None = None
+    top_k: int | None = None
     top_p: float | None = None
+    repetition_penalty: float | None = None
     seed: int | None = None
+    timestamp_type: Literal["word"] | None = None
 
 
 class ImageGenerationRequest(BaseModel):
