@@ -420,34 +420,29 @@ WebSocket TTFA, `tts_ws_ttfa`:
 
 | concurrency | M* p50 | M* p90 | omni p50 | omni p90 |
 |---|---|---|---|---|
-| 1  | 44 ms | 52 ms | 39 ms | 45 ms |
+| 1  | **35 ms** | 36 ms | 41 ms | 45 ms |
 | 4  | 93 ms | 113 ms | 85 ms | 92 ms |
 | 8  | 120 ms | 136 ms | 105 ms | 146 ms |
 | 16 | 134 ms | 161 ms | 202 ms | 224 ms |
-| 32 | **180 ms** | 198 ms | 495 ms | 531 ms |
+| 32 | **162 ms** | 314 ms | 503 ms | 541 ms |
 
 Read honestly:
 
-- **At concurrency 1, vllm-omni's first byte arrives ~4 ms earlier** (40 vs
-  44 ms; reproducible over 24 reps, spread under 1 ms on M*). That is a real,
-  repeatable difference, and it is a chunk-size trade rather than an engine
-  one: vllm-omni's codec emits **80 ms** of audio per frame, M* emits **160 ms**
-  (`codec_chunk_frames=2`). M* therefore needs two decoded frames before its
-  first emission where vllm-omni needs one, and delivers twice the audio when
-  it arrives.
+- **M* is now ahead at every concurrency, including c=1** (35 vs 41 ms). It was
+  not: with a uniform `codec_chunk_frames=2` M* emitted 160 ms per frame against
+  vllm-omni's 80 ms, so it needed two decoded frames before its first emission
+  where vllm-omni needed one, and measured 45.6 vs 39.2 ms. A shorter FIRST
+  chunk (`codec_first_chunk_frames: 1`) closed that and then some — 30.6 ms,
+  a 33% cut — with throughput unchanged, because the steady-state chunk never
+  moved. See [Word timestamps](#word-timestamps) for the profile and the
+  [engine roadmap](../mstar-speech-serving-roadmap.md) for where the idea came
+  from.
 
-  M* cannot go lower. `codec_chunk_frames=1` requires
-  `codec_left_context_frames=0` to satisfy `chunk > left_context`, and that
-  configuration produces **no audio at all** — the server starts, accepts
-  requests, and neither REST nor WebSocket ever emits a frame (verified). Two
-  frames is the floor.
+  M*'s TTFA is also far more *predictable* — 0.8 ms spread across the corpus
+  against 5.1 ms for vllm-omni — which matters more than a few ms for a pipeline
+  budgeting end-to-end turn latency.
 
-  Whether 4 ms matters is a product judgement: it is well under the ~100 ms
-  humans notice, and M*'s TTFA is also far more *predictable* (0.8 ms spread
-  across the corpus vs 5.1 ms for vllm-omni), which matters more for a
-  pipeline budgeting end-to-end turn latency.
-
-- **Everything above concurrency 1 goes the other way, decisively.** M* holds
+- **Under load the gap widens, decisively.** M* holds
   RTF under 1.0 through c=32; vllm-omni crosses 1.0 between c=8 and c=16,
   meaning it can no longer keep up with realtime playback. For a voice agent
   that is the capacity ceiling, and it arrives long before any error does.
