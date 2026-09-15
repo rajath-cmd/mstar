@@ -69,7 +69,10 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import LeftContextChunkPolicy
+from mstar.streaming.chunk_policy import (
+    GrowingLeftContextChunkPolicy,
+    LeftContextChunkPolicy,
+)
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 # ---------------------------------------------------------------------------
@@ -212,10 +215,14 @@ class Qwen3TTSModel(Model):
         # It was previously readable only from the checkpoint's
         # speech_tokenizer/config.json, so no deployment could tune it. Accepting
         # it as a model kwarg is what makes a low-latency profile expressible.
-        for name in ("codec_chunk_frames", "codec_left_context_frames"):
+        for name in ("codec_chunk_frames", "codec_left_context_frames",
+                     "codec_first_chunk_frames"):
             value = kwargs.pop(name, None)
             if value is not None:
                 setattr(self.config.codec, name.removeprefix("codec_"), int(value))
+        growing = kwargs.pop("codec_growing_left_context", None)
+        if growing is not None:
+            self.config.codec.growing_left_context = bool(growing)
         if self.config.tts_model_type != "custom_voice":
             raise ValueError(
                 "The first Qwen3-TTS integration supports only CustomVoice "
@@ -391,6 +398,14 @@ class Qwen3TTSModel(Model):
         the duplicated PCM prefix before emission.
         """
         codec = self.config.codec
+        if codec.first_chunk_frames is not None and not codec.growing_left_context:
+            raise ValueError(
+                "codec.first_chunk_frames requires codec.growing_left_context=true. "
+                "The non-growing policy takes its full left context from the first "
+                "pop, so a shortened first chunk cannot be expressed there and the "
+                "setting would be silently ignored -- leaving TTFA unchanged while "
+                "the config claimed otherwise."
+            )
         return PartitionTopology(
             partitions=["Talker", "Codec"],
             connections=[
@@ -398,9 +413,17 @@ class Qwen3TTSModel(Model):
                     from_partition="Talker",
                     to_partition="Codec",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: LeftContextChunkPolicy(
-                        chunk=codec.chunk_frames,
-                        left_context=codec.left_context_frames,
+                    chunk_policy_factory=lambda: (
+                        GrowingLeftContextChunkPolicy(
+                            chunk=codec.chunk_frames,
+                            left_context=codec.left_context_frames,
+                            first_chunk=codec.first_chunk_frames,
+                        )
+                        if codec.growing_left_context
+                        else LeftContextChunkPolicy(
+                            chunk=codec.chunk_frames,
+                            left_context=codec.left_context_frames,
+                        )
                     ),
                 ),
             ],

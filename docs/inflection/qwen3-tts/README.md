@@ -420,21 +420,32 @@ WebSocket TTFA, `tts_ws_ttfa`:
 
 | concurrency | M* p50 | M* p90 | omni p50 | omni p90 |
 |---|---|---|---|---|
-| 1  | 44 ms | 52 ms | 39 ms | 45 ms |
+| 1  | **35 ms** | 36 ms | 41 ms | 45 ms |
 | 4  | 93 ms | 113 ms | 85 ms | 92 ms |
 | 8  | 120 ms | 136 ms | 105 ms | 146 ms |
 | 16 | 134 ms | 161 ms | 202 ms | 224 ms |
-| 32 | **180 ms** | 198 ms | 495 ms | 531 ms |
+| 32 | **162 ms** | 314 ms | 503 ms | 541 ms |
 
 Read honestly:
 
-- **At concurrency 1 the two are equivalent on TTFA** (39 vs 44 ms — inside
-  run-to-run noise, and vllm-omni is nominally ahead). Anyone quoting a
-  single-stream latency win is quoting noise.
-- **The difference is what happens under load.** M* holds RTF under 1.0 through
-  c=32; vllm-omni crosses 1.0 between c=8 and c=16, meaning it can no longer
-  keep up with realtime playback. For a voice agent that is the capacity
-  ceiling, and it arrives long before any error does.
+- **M* is now ahead at every concurrency, including c=1** (35 vs 41 ms). It was
+  not: with a uniform `codec_chunk_frames=2` M* emitted 160 ms per frame against
+  vllm-omni's 80 ms, so it needed two decoded frames before its first emission
+  where vllm-omni needed one, and measured 45.6 vs 39.2 ms. A shorter FIRST
+  chunk (`codec_first_chunk_frames: 1`) closed that and then some — 30.6 ms,
+  a 33% cut — with throughput unchanged, because the steady-state chunk never
+  moved. See [Word timestamps](#word-timestamps) for the profile and the
+  [engine roadmap](../mstar-speech-serving-roadmap.md) for where the idea came
+  from.
+
+  M*'s TTFA is also far more *predictable* — 0.8 ms spread across the corpus
+  against 5.1 ms for vllm-omni — which matters more than a few ms for a pipeline
+  budgeting end-to-end turn latency.
+
+- **Under load the gap widens, decisively.** M* holds
+  RTF under 1.0 through c=32; vllm-omni crosses 1.0 between c=8 and c=16,
+  meaning it can no longer keep up with realtime playback. For a voice agent
+  that is the capacity ceiling, and it arrives long before any error does.
 - At c=32 M* is 7.8x lower batch latency, 6.6x throughput, 2.75x lower TTFA.
 - Both arms 100% success at every level.
 

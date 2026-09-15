@@ -46,7 +46,26 @@ echo "port  : $PORT   gpus: $GPUS"
 echo "config: $CONFIG"
 echo "log   : $LOG"
 
+# Isolate this server's ZMQ IPC namespace BY PORT.
+#
+# `mstar serve` defaults the prefix to /tmp/mstar_$USER/ -- per USER, not per
+# SERVER. Two servers started by the same user therefore bind the same
+# /tmp/mstar_$USER/worker_0.ipc, conductor.ipc and api_server.ipc, and they
+# steal each other's messages: a request POSTed to server B gets executed by
+# server A's engine, under A's config, while B waits forever.
+#
+# Nothing errors. Both servers report healthy, /v1/models answers, and only
+# requests hang -- which reads exactly like a model bug. Anything that runs two
+# M* servers on one box (an A/B test, or serving Qwen3-TTS and Voxtral-RT side
+# by side) MUST set this.
+SOCKET_PREFIX="${MSTAR_SOCKET_PREFIX:-/tmp/mstar_${USER:-u}_${PORT}/}"
+UPLOAD_DIR="${MSTAR_UPLOAD_DIR:-/tmp/mstar_uploads_${USER:-u}_${PORT}/}"
+mkdir -p "$SOCKET_PREFIX" "$UPLOAD_DIR"
+echo "ipc   : $SOCKET_PREFIX"
+
 exec "$REPO/.venv/bin/mstar" serve qwen3_tts \
     --config "$CONFIG" \
     --gpus "$GPUS" --host 0.0.0.0 --port "$PORT" \
+    --socket-path-prefix "$SOCKET_PREFIX" \
+    --upload-dir "$UPLOAD_DIR" \
     --log-level INFO >"$LOG" 2>&1

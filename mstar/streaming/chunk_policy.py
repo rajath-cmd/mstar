@@ -76,6 +76,95 @@ class SlidingWindowChunkPolicy(ChunkPolicy):
         return self._window
 
 
+class GrowingLeftContextChunkPolicy(ChunkPolicy):
+    """Streaming vocoder policy whose left context GROWS to its target.
+
+    Matches vllm-omni's ``chunked_decode`` and VoxServe's detokenizer stepping:
+
+        Iter 0: codes[0 : chunk]                     ctx = 0
+        Iter 1: codes[0 : chunk + 1*chunk]           ctx = min(L, 1*chunk)
+        Iter k: codes[k*chunk - ctx : k*chunk + chunk]
+                                                     ctx = min(L, k*chunk)
+
+    The stride is ALWAYS ``chunk``; the context simply grows from nothing up to
+    ``left_context`` as history accumulates. ``LeftContextChunkPolicy`` instead
+    takes the full context from the very first pop, which forces it to advance
+    by ``chunk - left_context`` and therefore to require ``chunk > left_context``.
+
+    That constraint is the reason M* could not run ``chunk_frames=1``: with
+    one-frame chunks the only legal context is 0, and
+    ``chunk=1, left_context=0`` produces no audio at all. This policy removes
+    it, so ``chunk=1, left_context=15`` -- what vllm-omni actually ships -- is
+    expressible: audio leaves after ONE 80 ms frame instead of two, with MORE
+    vocoder context at the boundaries rather than less.
+
+    Because the buffer drops ``stride`` items from its front on every pop, a
+    growing window is expressed as a stride that starts at zero and rises to
+    ``chunk`` as the context fills:
+
+        stride_k = chunk - (ctx_{k+1} - ctx_k)
+
+    which is 0 while the context is still growing and ``chunk`` once it
+    saturates. Nothing is lost while the stride is 0 -- those frames are still
+    needed as context for the next pop.
+
+    ``first_chunk`` shortens the FIRST emission only. This is the single
+    cheapest latency win available to a streaming TTS server, and it is what
+    VoxServe calls ``first_chunk_frames`` and vllm-omni calls
+    ``codec_chunk_frames_at_begin``: time-to-first-audio is set by how many
+    frames must be decoded before ANY audio leaves, while throughput is set by
+    the steady-state chunk. Decoupling the two costs nothing -- one smaller
+    vocoder call, once per request -- and it is strictly better than lowering
+    ``chunk`` globally, which pays the same overhead on every chunk forever.
+    """
+
+    def __init__(self, chunk: int, left_context: int, first_chunk: int | None = None):
+        super().__init__()
+        if chunk < 1:
+            raise ValueError(f"chunk must be >= 1, got {chunk}")
+        if left_context < 0:
+            raise ValueError(f"left_context must be >= 0, got {left_context}")
+        if first_chunk is not None and not 1 <= first_chunk <= chunk:
+            raise ValueError(
+                f"first_chunk must be in [1, chunk]; got first_chunk={first_chunk}, "
+                f"chunk={chunk}. A first chunk LARGER than the steady-state chunk "
+                f"would raise time-to-first-audio, which is the opposite of why "
+                f"this knob exists."
+            )
+        self._chunk = chunk
+        self._left_context = left_context
+        self._first_chunk = chunk if first_chunk is None else first_chunk
+        self._pops = 0
+
+    def _emit_size(self, pop_index: int) -> int:
+        return self._first_chunk if pop_index == 0 else self._chunk
+
+    def _emitted_before(self, pop_index: int) -> int:
+        """Frames already turned into emitted audio before ``pop_index``."""
+        if pop_index <= 0:
+            return 0
+        return self._first_chunk + (pop_index - 1) * self._chunk
+
+    def _context_at(self, pop_index: int) -> int:
+        """Context frames available before pop ``pop_index``."""
+        return min(self._left_context, self._emitted_before(pop_index))
+
+    def register_chunk(self, chunk_size: int):
+        super().register_chunk(chunk_size)
+        self._pops += 1
+
+    def is_ready(self, buffer_len: int) -> bool:
+        return buffer_len >= self.window_size()
+
+    def next_chunk_size(self, buffer_len: int) -> int:
+        del buffer_len
+        grow = self._context_at(self._pops + 1) - self._context_at(self._pops)
+        return self._emit_size(self._pops) - grow
+
+    def window_size(self) -> int:
+        return self._context_at(self._pops) + self._emit_size(self._pops)
+
+
 class LeftContextChunkPolicy(ChunkPolicy):
     """Chunk policy for streaming vocoders with left-context overlap.
 
