@@ -352,7 +352,7 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     model = _make_model()
     pointers = {
         name: [SimpleNamespace(name=name)]
-        for name in ("text_inputs", "speaker_id", "language_id")
+        for name in ("text_inputs", "speaker_id", "language_id", "align_enabled")
     }
 
     talker = model.get_initial_forward_pass_args(
@@ -483,13 +483,48 @@ def _tiny_model_config() -> Qwen3TTSModelConfig:
     )
 
 
-def test_qwen3_tts_talker_builds_official_streaming_prefill():
+def _prefill_submodule():
     config = _tiny_model_config()
-    talker = Qwen3TTSTalkerModel(config)
-    predictor = Qwen3TTSCodePredictor(config)
-    submodule = TalkerSubmodule(talker, predictor, config)
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+    )
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
+    return submodule
+
+
+def test_qwen3_tts_talker_builds_official_packed_prefill():
+    """Packed is the default: the whole prompt is prefilled, decode sees PAD.
+
+    This is the layout the official CustomVoice helper and vllm-omni both run
+    (``non_streaming_mode=True``), and the only one word timestamps can be read
+    out of -- the pointer head needs the text-token hidden states to exist as a
+    contiguous span, which under the interleaved layout they never do.
+
+    Prompt is 12 tokens: 3 ChatML prefix + 4 text + 5 ChatML suffix. Prefill is
+    3 role rows + 5 codec-tag rows + (4 text + 1 EOS) rows + 1 PAD/BOS row = 14.
+    """
+    submodule = _prefill_submodule()
+
+    embeds = submodule._build_prefill(
+        request_id="request",
+        text_ids=torch.arange(1, 13),
+        speaker_id=40,
+        language_id=-1,
+    )
+
+    assert embeds.shape == (14, 16)
+    state = submodule.request_state("request")
+    # Nothing left to drain: decode is PAD-conditioned from its first step.
+    assert state["trailing_text_hidden"].shape == (0, 16)
+    assert state["tts_pad_embed"].shape == (16,)
+    assert state["generation_step"] == 0
+
+
+def test_qwen3_tts_talker_builds_interleaved_prefill_when_unpacked():
+    """The Base task's layout: first text token only, rest drained at decode."""
+    submodule = _prefill_submodule()
+    submodule.PACKED_TEXT_PREFILL = False
 
     embeds = submodule._build_prefill(
         request_id="request",
@@ -501,8 +536,20 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     assert embeds.shape == (9, 16)
     state = submodule.request_state("request")
     assert state["trailing_text_hidden"].shape == (4, 16)
-    assert state["tts_pad_embed"].shape == (16,)
     assert state["generation_step"] == 0
+
+
+def test_qwen3_tts_packed_prefill_registers_no_alignment_without_a_head():
+    """Capture is opt-in AND head-gated; neither holds here, so nothing opens."""
+    submodule = _prefill_submodule()
+    submodule._build_prefill(
+        request_id="request",
+        text_ids=torch.arange(1, 13),
+        speaker_id=40,
+        language_id=-1,
+        align_enabled=True,
+    )
+    assert submodule._text_spans == {}
 
 
 def test_qwen3_tts_talker_rejects_changed_chatml_layout():

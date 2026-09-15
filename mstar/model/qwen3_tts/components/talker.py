@@ -128,6 +128,41 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
     # copy, so the cost when nobody reads it is a pointer store.
     aux_hidden_state_layer: int | None = None
 
+    # Destination for the tap. The decode path is CUDA-graph captured, and a
+    # graph replays the KERNELS it recorded, not the Python around them -- so
+    # stashing a reference to an intermediate activation is not enough: every
+    # replay would hand back whatever that address held, which in practice is
+    # the same capture-time values for every frame of every request. Copying
+    # into a buffer allocated OUTSIDE the graph pool makes the copy itself a
+    # recorded kernel, so each replay refreshes it.
+    #
+    # The failure mode this prevents is silent. Identical frames still produce
+    # finite pointer scores and a well-formed monotone alignment; it just puts
+    # every word at one frame and dumps the remaining audio on the last one.
+    aux_hidden_state_buffer: torch.Tensor | None = None
+    # Rows the buffer can hold. Decode needs one row per batched request;
+    # prefill needs one per prompt token and falls back to a plain reference
+    # (it runs eagerly) when a prompt is longer than this.
+    AUX_BUFFER_ROWS = 4096
+
+    def _ensure_aux_buffer(self, rows: int, ref: torch.Tensor) -> torch.Tensor | None:
+        """Lazily allocate the tap's destination, sized to the model's width."""
+        if rows > self.AUX_BUFFER_ROWS:
+            return None
+        buf = self.aux_hidden_state_buffer
+        if (
+            buf is None
+            or buf.shape[1] != ref.shape[-1]
+            or buf.dtype != ref.dtype
+            or buf.device != ref.device
+        ):
+            buf = torch.zeros(
+                self.AUX_BUFFER_ROWS, ref.shape[-1],
+                dtype=ref.dtype, device=ref.device,
+            )
+            self.aux_hidden_state_buffer = buf
+        return buf
+
     def forward(
         self,
         input_embeds: torch.Tensor,
@@ -145,11 +180,26 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         self.last_aux_hidden_state = None
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states)
             if aux_idx is not None and layer_idx == aux_idx:
-                # Post-layer, pre-final-norm — matching what the head was
-                # trained against (HF's ``outputs.hidden_states[N]``).
-                self.last_aux_hidden_state = hidden_states
+                # Captured BEFORE this layer runs, i.e. the INPUT to layer
+                # ``aux_idx``. That is HF's ``outputs.hidden_states[aux_idx]``
+                # (index 0 being the embedding output), which is what the
+                # pointer head was trained against, and it is also exactly what
+                # vLLM's ``aux_hidden_state_layers`` yields -- it appends
+                # ``hidden_states + residual`` before calling ``layers[idx]``.
+                #
+                # Capturing after the layer instead is off by one and silently
+                # so: the head still returns finite scores for a layer it never
+                # saw, and the Viterbi walk turns them into plausible-looking
+                # word times that are simply wrong.
+                rows = hidden_states.shape[0]
+                buf = self._ensure_aux_buffer(rows, hidden_states)
+                if buf is None:
+                    self.last_aux_hidden_state = hidden_states
+                else:
+                    buf[:rows].copy_(hidden_states)
+                    self.last_aux_hidden_state = buf[:rows]
+            hidden_states = layer(hidden_states)
         # Sequence lengths still advance once per forward, after every layer
         # wrote K/V for the same packed range — the runner does it now, on the
         # step this forward was declared from.
@@ -175,6 +225,11 @@ class Qwen3TTSTalkerModel(nn.Module):
         self.codec_head = nn.Linear(
             talker.hidden_size, talker.vocab_size, bias=False
         )
+
+    @property
+    def aux_hidden_state_buffer(self) -> torch.Tensor | None:
+        """The tap's destination buffer, or None before the first forward."""
+        return self.model.aux_hidden_state_buffer
 
     @property
     def aux_hidden_state_layer(self) -> int | None:

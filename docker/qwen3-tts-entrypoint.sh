@@ -22,6 +22,26 @@ else
     echo "note: no pointer_head.pt — word-timestamp requests return no words"
 fi
 
+# uvicorn resolves its WebSocket implementation at bind time and, finding none,
+# degrades to answering every upgrade with 404 instead of refusing to start. A
+# TTS server that serves REST but silently 404s /v1/audio/speech/stream is worse
+# than one that fails to boot, so make it fail to boot.
+python - <<'PREFLIGHT' || die "WebSocket support missing; rebuild the image"
+import sys
+try:
+    from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol as P
+except Exception as exc:
+    sys.exit(f"cannot resolve a uvicorn WebSocket protocol: {exc}")
+if P is None or "Unsupported" in P.__name__:
+    sys.exit("uvicorn has no WebSocket protocol; install websockets or wsproto")
+print(f"preflight: websocket protocol = {P.__name__}")
+try:
+    import prometheus_client  # noqa: F401
+    print("preflight: prometheus_client present, /metrics live")
+except ImportError:
+    print("preflight: WARNING prometheus_client absent, /metrics will be empty")
+PREFLIGHT
+
 echo "model : $MODEL"
 echo "config: $CONFIG"
 echo "port  : $PORT   gpus: $GPUS"

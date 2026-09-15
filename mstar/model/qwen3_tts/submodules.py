@@ -91,6 +91,10 @@ class TalkerSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (151644, 77091, 198)
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (151645, 198, 151644, 77091, 198)
+    # See ``_build_prefill``. Packed is what the official CustomVoice helper
+    # and vllm-omni both run; flip to False only to reproduce the Base task's
+    # interleaved conditioning.
+    PACKED_TEXT_PREFILL = True
 
     def __init__(
         self,
@@ -110,6 +114,14 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         # Lazy frame-local CodePredictor KV scratch, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
+
+        # request_id -> (packed-batch row offset, span length) for the forward
+        # pass currently in flight. Written by ``preprocess``, read by the
+        # alignment hook in ``postprocess``. Without it the hook cannot tell
+        # which rows of the batched aux hidden state belong to which request.
+        self._batch_spans: dict[str, tuple[int, int]] = {}
+        # request_id -> (text_span_start, text_span_end) within its own prefill.
+        self._text_spans: dict[str, tuple[int, int]] = {}
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -206,13 +218,32 @@ class TalkerSubmodule(ARNodeSubmodule):
         text_ids: torch.Tensor,
         speaker_id: int,
         language_id: int,
+        align_enabled: bool = False,
     ) -> torch.Tensor:
         """Build the official mixed text/codec prefill embedding sequence.
 
-        The assistant-role prefix and codec conditioning tags enter the
-        one-shot prefill. Remaining prompt text is retained in per-request
-        state and added one token at a time to later recurrent codec embeds.
-        This aligns text progress with the 12 Hz acoustic generation steps.
+        Two layouts exist upstream, and which one runs is a real behavioural
+        choice, not an implementation detail:
+
+        *interleaved* — the prefill carries the assistant role, the codec
+        conditioning tags, and only the FIRST text token; the rest of the
+        prompt is retained per request and added one token at a time to later
+        recurrent codec embeds, pacing text against the 12.5 Hz acoustic step.
+
+        *packed* — the whole prompt enters the prefill, summed with codec PAD
+        embeddings, and decode is conditioned on PAD throughout.
+
+        The official CustomVoice and VoiceDesign generation helpers use PACKED
+        (vllm-omni spells this ``non_streaming_mode`` and defaults it to True
+        for both task types); only the Base task uses interleaved. M* serves
+        CustomVoice, so packed is the default here and the two servers produce
+        the same conditioning sequence for the same request.
+
+        Packed is also the only layout word timestamps can be read out of: the
+        pointer head attends over text-token hidden states, and those exist as
+        a contiguous span only when the text was prefilled. Under interleaved
+        each text token's hidden state is produced in a different decode step,
+        already entangled with the acoustic frame it was summed into.
         """
         text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
         expected_prefix = text_ids.new_tensor(
@@ -278,17 +309,53 @@ class TalkerSubmodule(ARNodeSubmodule):
             ).to(codec_embeds.dtype)
             + codec_embeds[:, -1:]
         )
-        prefill = torch.cat([role_embed, tag_embed, first_text], dim=1)
+        if self.PACKED_TEXT_PREFILL:
+            # Packed layout. Every text token is summed with a codec PAD embed
+            # and prefilled; a final PAD+BOS row opens the acoustic stream. The
+            # fixed five-token ChatML suffix is replaced by projected TTS EOS.
+            text_all = torch.cat([
+                self._project_text(
+                    text_ids[:, prefix_len:-suffix_len]
+                ).to(codec_embeds.dtype),
+                eos_embed,
+            ], dim=1)
+            pad_ids = torch.full(
+                (1, int(text_all.shape[1])),
+                int(codec.codec_pad_id),
+                dtype=torch.long,
+                device=self.get_device(),
+            )
+            bos_ids = torch.tensor(
+                [[codec.codec_bos_id]], dtype=torch.long, device=self.get_device()
+            )
+            text_span_start = int(role_embed.shape[1] + tag_embed.shape[1])
+            prefill = torch.cat([
+                role_embed,
+                tag_embed,
+                text_all + self.model.model.codec_embedding(pad_ids),
+                pad_embed + self.model.model.codec_embedding(bos_ids),
+            ], dim=1)
+            # Decode is PAD-conditioned throughout; there is no queue left to
+            # drain. An empty trailing tensor makes ``prepare_inputs`` fall
+            # through to ``tts_pad_embed`` on the very first step.
+            trailing = eos_embed[:, :0]
+            self._register_alignment(
+                request_id,
+                text_ids=text_ids,
+                prefix_len=prefix_len,
+                suffix_len=suffix_len,
+                text_span_start=text_span_start,
+                align_enabled=align_enabled,
+            )
+        else:
+            prefill = torch.cat([role_embed, tag_embed, first_text], dim=1)
+            trailing = torch.cat([
+                self._project_text(
+                    text_ids[:, prefix_len + 1:-suffix_len]
+                ).to(codec_embeds.dtype),
+                eos_embed,
+            ], dim=1)
 
-        # The fixed five-token ChatML suffix is replaced by projected TTS EOS.
-        # Decode consumes this tensor by ``generation_step`` and uses PAD once
-        # the text condition has been exhausted.
-        trailing = torch.cat([
-            self._project_text(
-                text_ids[:, prefix_len + 1:-suffix_len]
-            ).to(codec_embeds.dtype),
-            eos_embed,
-        ], dim=1)
         self.request_state(request_id).add_all(
             trailing_text_hidden=trailing.squeeze(0),
             tts_pad_embed=pad_embed[0, 0],
@@ -313,11 +380,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         """
         del kwargs
         if graph_walk == "talker_prefill":
+            align_input = inputs.get("align_enabled")
             input_embeds = self._build_prefill(
                 fwd_info.request_id,
                 inputs["text_inputs"][0],
                 int(inputs["speaker_id"][0].item()),
                 int(inputs["language_id"][0].item()),
+                align_enabled=bool(align_input[0].item()) if align_input else False,
             )
             state = self.request_state(fwd_info.request_id)
         elif graph_walk == "talker_decode":
@@ -368,8 +437,18 @@ class TalkerSubmodule(ARNodeSubmodule):
         FlashInfer receives separate sequence lengths and KV page tables.
         """
 
-        del engine_inputs
         seq_lens = [item.input_seq_len for item in inputs]
+        # Record where each request's rows land in the packed batch BEFORE the
+        # forward runs, so the alignment hook can slice the batched aux hidden
+        # state per request. Reading the last row instead is correct only at
+        # batch size one, and wrong -- silently, with plausible timestamps --
+        # for every concurrently served request beyond the first.
+        self._batch_spans = {}
+        offset = 0
+        for rid, span in zip(engine_inputs.request_ids, seq_lens, strict=False):
+            self._batch_spans[rid] = (offset, span)
+            offset += span
+        del engine_inputs
         input_embeds = [
             item.input_embeds for item in inputs if item.input_embeds is not None
         ]
@@ -619,7 +698,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         as a fallback.  This keeps EOS detection correct even if an execution
         path filters the sampler-only output before slow-path ``check_stop``.
         """
-        del request_info, kwargs
+        del kwargs
         if "new_token" in outputs:
             outputs["layer0_codes"] = outputs.pop("new_token")
         elif "layer0_codes" not in outputs and "codec_tokens" in outputs:
@@ -630,29 +709,105 @@ class TalkerSubmodule(ARNodeSubmodule):
             state.add(
                 "generated_frames", int(state.get("generated_frames", 0)) + 1
             )
-        self._accumulate_alignment_frame(request_id)
+        self._accumulate_alignment_frame(
+            request_id, getattr(request_info, "graph_walk", "")
+        )
 
-    def _accumulate_alignment_frame(self, request_id: str) -> None:
-        """Hand this frame's aux hidden state to the word-alignment registry.
+    def _register_alignment(
+        self,
+        request_id: str,
+        *,
+        text_ids: torch.Tensor,
+        prefix_len: int,
+        suffix_len: int,
+        text_span_start: int,
+        align_enabled: bool,
+    ) -> None:
+        """Open a word-alignment capture for this request, if one was asked for.
 
-        This is the per-request, per-frame hook the alignment capture needs, and
-        it is the direct analogue of vllm-omni's runner -> accumulate_decode
-        seam — cleaner, because M* routes the frame's tensors per request here
-        rather than requiring a query_start_loc slice out of a batched tensor.
+        Registration is the gate for the whole capture path: ``accumulate_*``
+        no-ops for an unregistered id, so a request that did not ask for
+        timestamps pays nothing beyond this check.
 
-        Never raises: alignment is a sidecar, and a failure in it must not cost
-        the caller their audio.
+        Never raises. Alignment is a sidecar; a failure in it must not cost the
+        caller their audio.
+        """
+        head = getattr(self.model, "alignment_head", None)
+        layer = getattr(self.model, "aux_hidden_state_layer", None)
+        self._text_spans.pop(request_id, None)
+        if not align_enabled or head is None or layer is None:
+            return
+        ids = text_ids[0, prefix_len:-suffix_len].tolist()
+        # The projected TTS EOS occupies one prefilled row past the real text
+        # and carries no token of its own; the pointer head must not see it as
+        # a candidate, or trailing silence gets attributed to the last word.
+        span_end = text_span_start + len(ids)
+        try:
+            from mstar.model.qwen3_tts.temporal_alignment.registry import get_registry
+
+            get_registry().register(
+                request_id,
+                text_token_ids=ids,
+                text_token_start=text_span_start,
+                text_token_end=span_end,
+                layer=int(layer),
+                tokenizer=getattr(self.model, "alignment_tokenizer", None),
+                head=head,
+            )
+            self._text_spans[request_id] = (text_span_start, span_end)
+        except Exception:  # noqa: BLE001 — a sidecar must not break generation
+            pass
+
+    def _accumulate_alignment_frame(self, request_id: str, graph_walk: str) -> None:
+        """Hand this pass's aux hidden state to the word-alignment registry.
+
+        Prefill contributes the text-token hidden states the pointer head
+        attends over; every decode step contributes one acoustic frame. Both
+        arrive here as slices of the packed batch, located by ``_batch_spans``.
+
+        Never raises, for the same reason as ``_register_alignment``.
         """
         if getattr(self.model, "alignment_head", None) is None:
             return
-        aux = getattr(self.model, "last_aux_hidden_state", None)
+        # Read the tap's persistent buffer, NOT ``last_aux_hidden_state``.
+        # That attribute is assigned during Python execution, which for a
+        # CUDA-graph-captured decode happens once, at capture; whichever graph
+        # was captured last would own it, and its row count would be that
+        # graph's batch size rather than this step's. The buffer address is
+        # stable across every graph, and ``_batch_spans`` says which rows are
+        # ours, so index it directly.
+        aux = getattr(self.model, "aux_hidden_state_buffer", None)
         if aux is None:
+            aux = getattr(self.model, "last_aux_hidden_state", None)
+        if aux is None or aux.dim() != 2:
+            return
+        span = self._batch_spans.get(request_id)
+        if span is None:
+            return
+        start, length = span
+        if start + length > aux.shape[0]:
             return
         try:
             from mstar.model.qwen3_tts.temporal_alignment.registry import get_registry
 
-            row = aux[-1] if aux.dim() == 2 else aux
-            get_registry().accumulate_decode(request_id, row.detach())
+            registry = get_registry()
+            if graph_walk == "talker_decode":
+                registry.accumulate_decode(request_id, aux[start].detach())
+                return
+            text_span = self._text_spans.get(request_id)
+            if text_span is None:
+                return
+            text_start, text_end = text_span
+            # Global positions here are positions within THIS request's own
+            # prefill, which is exactly the frame ``register`` recorded the
+            # text span in. The registry intersects the two and keeps the
+            # overlap, so a chunked prefill would compose correctly too.
+            registry.accumulate_prefill(
+                request_id,
+                aux[start + text_start:start + text_end].detach(),
+                text_start,
+                text_end,
+            )
         except Exception:  # noqa: BLE001 — a sidecar must not break generation
             pass
 
@@ -682,8 +837,30 @@ class TalkerSubmodule(ARNodeSubmodule):
             not ignore_eos and token == self.talker_config.codec_eos_token_id
         )
         if reached_eos or generated >= max_tokens:
+            self._finalize_alignment(request_id)
             return {"talker_decode_loop"}
         return set()
+
+    def _finalize_alignment(self, request_id: str) -> None:
+        """Run the Viterbi readout and publish the request's word alignment.
+
+        Called from ``check_stop``, which the engine runs off the GPU execution
+        thread -- the right place for a decode-length dynamic-programming walk.
+        ``finalize`` writes the result to a disk drop as well as to memory,
+        because the API server runs in a different process from this worker and
+        can only see the drop.
+
+        Never raises: alignment is a sidecar.
+        """
+        self._batch_spans.pop(request_id, None)
+        if self._text_spans.pop(request_id, None) is None:
+            return
+        try:
+            from mstar.model.qwen3_tts.temporal_alignment.registry import get_registry
+
+            get_registry().finalize(request_id)
+        except Exception:  # noqa: BLE001 — a sidecar must not break generation
+            pass
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.

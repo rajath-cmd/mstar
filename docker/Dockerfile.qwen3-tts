@@ -63,6 +63,26 @@ RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
         torchaudio==${TORCHAUDIO_VERSION} \
         torchcodec==${TORCHCODEC_VERSION}
 
+# Serving deps that the library extras do not pull in. Both are load-bearing and
+# both fail QUIETLY when missing, which is why they are pinned here explicitly:
+#
+#   websockets -- uvicorn has no WebSocket protocol implementation of its own. If
+#     none is importable it logs "Unsupported upgrade request" at WARNING and
+#     answers every /v1/audio/speech/stream handshake with 404. The route is
+#     registered and the code is correct; the server simply cannot upgrade. A
+#     dev checkout hides this because pytest's own deps supply websockets.
+#   prometheus_client -- mstar.metrics falls back to no-op stubs without it, so
+#     /metrics returns an empty exposition and every dashboard reads flat zero.
+RUN uv pip install --python /opt/mstar/venv/bin/python \
+        "websockets>=12" "prometheus-client>=0.20"
+
+# Fail the BUILD, not a caller's first WebSocket connection.
+RUN /opt/mstar/venv/bin/python -c "\
+import websockets, prometheus_client; \
+from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol as P; \
+assert P is not None, 'uvicorn resolved no WebSocket protocol'; \
+print('ws+metrics deps OK:', P.__name__)"
+
 # The venv MUST lead PATH. FlashInfer JIT-compiles attention kernels and shells
 # out to `ninja` via a PATH lookup at request time; without this the server logs
 # "FileNotFoundError: ninja" on every capture and never binds.

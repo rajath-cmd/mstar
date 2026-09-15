@@ -304,7 +304,7 @@ class Qwen3TTSModel(Model):
         # Talker-to-Codec stream.
         talker_prefill = GraphNode(
             name="Talker",
-            input_names=["text_inputs", "speaker_id", "language_id"],
+            input_names=["text_inputs", "speaker_id", "language_id", "align_enabled"],
             outputs=[
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
@@ -480,12 +480,23 @@ class Qwen3TTSModel(Model):
             text_inputs = text_inputs[0]
 
         language_id = self.config.talker.codec_language_id.get(language, -1)
+        # Word-timestamp capture is opt-in per request. It is not free: every
+        # decoded frame's aux hidden state is copied to host memory and held
+        # for the life of the request, so a server that captured
+        # unconditionally would pay for it on traffic that never asks for
+        # timestamps. `timestamp_type` is the OpenAI-shaped field; the
+        # alias mirrors vllm-omni's internal spelling.
+        align_enabled = bool(
+            kwargs.get("timestamp_capture_enabled")
+            or str(kwargs.get("timestamp_type") or "").lower() == "word"
+        )
         return {
             "text_inputs": [text_inputs.to(dtype=torch.long)],
             "speaker_id": [torch.tensor(
                 [self.config.talker.spk_id[speaker]], dtype=torch.long
             )],
             "language_id": [torch.tensor([language_id], dtype=torch.long)],
+            "align_enabled": [torch.tensor([int(align_enabled)], dtype=torch.long)],
         }
 
     # -----------------------------------------------------------------------
@@ -518,7 +529,7 @@ class Qwen3TTSModel(Model):
                 },
             )
             inputs = []
-            for name in ("text_inputs", "speaker_id", "language_id"):
+            for name in ("text_inputs", "speaker_id", "language_id", "align_enabled"):
                 edge = GraphEdge(next_node="Talker", name=name)
                 edge.tensor_info = input_signals.get(name, [])
                 inputs.append(edge)
@@ -788,6 +799,11 @@ class Qwen3TTSModel(Model):
                 talker.alignment_head = head
                 talker.alignment_layer = layer
                 talker.aux_hidden_state_layer = layer
+                # The pointer head's readout maps text-token positions back to
+                # words, which needs the same tokenizer the prompt was encoded
+                # with. Carry it on the Talker so the submodule does not have
+                # to reach back through the model wrapper.
+                talker.alignment_tokenizer = self.tokenizer
         except Exception as e:  # noqa: BLE001 — never let the sidecar break serving
             logging.getLogger(__name__).warning("alignment head load failed; word timestamps disabled: %s", e)
 

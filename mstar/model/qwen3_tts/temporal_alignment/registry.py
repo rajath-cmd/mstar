@@ -565,6 +565,21 @@ class WordAlignmentRegistry:
                     _inc(TTS_ALIGNMENT_FINALIZE_TOTAL, outcome="no_words")
                     return None
                 scores = state.head(frame_hidden, word_keys)
+                if os.environ.get("MSTAR_ALIGN_DEBUG"):
+                    fh, th = frame_hidden.float(), text_hidden.float()
+                    logger.warning(
+                        "ALIGN_DEBUG %s frames=%s text=%s keys=%s | "
+                        "frame mean=%.4f std=%.4f rowstd=%.4f | "
+                        "text mean=%.4f std=%.4f rowstd=%.4f | "
+                        "scores %s min=%.3f max=%.3f argmax=%s",
+                        request_id, tuple(frame_hidden.shape), tuple(text_hidden.shape),
+                        tuple(word_keys.shape),
+                        fh.mean().item(), fh.std().item(), fh.std(dim=0).mean().item(),
+                        th.mean().item(), th.std().item(), th.std(dim=0).mean().item(),
+                        tuple(scores.shape), scores.float().min().item(),
+                        scores.float().max().item(),
+                        scores.float().argmax(dim=-1).tolist()[:40],
+                    )
                 word_dicts = word_timestamps_viterbi_full_coverage(scores, all_spans, rate=state.rate)
         except Exception as e:
             logger.exception("finalize(%s) raised — skipping: %s", request_id, e)
