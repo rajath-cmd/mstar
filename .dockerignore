@@ -1,0 +1,16 @@
+.venv
+**/.venv
+.git
+out/
+logs/
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+*.sqsh
+*.wav
+*.png
+*.html
+docs/_build
+rust/target
+**/node_modules

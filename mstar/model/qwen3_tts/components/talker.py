@@ -116,6 +116,18 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
             config.text_vocab_size, config.text_hidden_size
         )
 
+    # Index of an intermediate layer whose output is stashed on each forward,
+    # or None to capture nothing. The trained word-timestamp pointer head reads
+    # a MIDDLE layer (layer=3 on the shipped head), not the final hidden state
+    # this method returns, so alignment is impossible without a tap here. vLLM
+    # exposes the same thing as ``aux_hidden_state_layers``.
+    #
+    # Set once at load time, never per request: a per-request flag would make
+    # the captured graph depend on request state, and the decode path is CUDA-
+    # graph captured. Capturing unconditionally is a tensor reference, not a
+    # copy, so the cost when nobody reads it is a pointer store.
+    aux_hidden_state_layer: int | None = None
+
     def forward(
         self,
         input_embeds: torch.Tensor,
@@ -129,9 +141,15 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         # make inductor specialize on the int. The resources own the pages, so
         # module code stays clear of the allocator.
         self.layers[0].self_attn.attend.bind_step(label)
+        aux_idx = self.aux_hidden_state_layer
+        self.last_aux_hidden_state = None
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.set_layer_idx(layer_idx)
             hidden_states = layer(hidden_states)
+            if aux_idx is not None and layer_idx == aux_idx:
+                # Post-layer, pre-final-norm — matching what the head was
+                # trained against (HF's ``outputs.hidden_states[N]``).
+                self.last_aux_hidden_state = hidden_states
         # Sequence lengths still advance once per forward, after every layer
         # wrote K/V for the same packed range — the runner does it now, on the
         # step this forward was declared from.
@@ -157,6 +175,19 @@ class Qwen3TTSTalkerModel(nn.Module):
         self.codec_head = nn.Linear(
             talker.hidden_size, talker.vocab_size, bias=False
         )
+
+    @property
+    def aux_hidden_state_layer(self) -> int | None:
+        return self.model.aux_hidden_state_layer
+
+    @aux_hidden_state_layer.setter
+    def aux_hidden_state_layer(self, value: int | None) -> None:
+        self.model.aux_hidden_state_layer = value
+
+    @property
+    def last_aux_hidden_state(self) -> torch.Tensor | None:
+        """Hidden state of ``aux_hidden_state_layer`` from the latest forward."""
+        return getattr(self.model, "last_aux_hidden_state", None)
 
     def forward(
         self,

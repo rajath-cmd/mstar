@@ -79,6 +79,33 @@ class SpeechRequest(BaseModel):
     timestamp_type: Literal["word"] | None = None
 
 
+class WordAlignment(BaseModel):
+    """Per-word timing arrays (Inworld/ElevenLabs WORD convention).
+
+    ``words[i]`` is voiced from ``word_start_time_seconds[i]`` to
+    ``word_end_time_seconds[i]``. For WebSocket streaming the times are
+    TURN-relative (t=0 is the turn's first audio.start, inter-chunk silence
+    included); for REST they are relative to the returned audio.
+
+    Shape frozen to vllm-omni's so a client can parse either server's response
+    with one code path.
+    """
+
+    model_config = _CFG
+
+    words: list[str]
+    word_start_time_seconds: list[float]
+    word_end_time_seconds: list[float]
+
+
+class TimestampInfo(BaseModel):
+    """REST envelope field carrying word-level timing."""
+
+    model_config = _CFG
+
+    word_alignment: WordAlignment | None = None
+
+
 class ImageGenerationRequest(BaseModel):
     """OpenAI ``/v1/images/generations``."""
 

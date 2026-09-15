@@ -287,6 +287,11 @@ CPU-checkable halves (request schema, adapter mapping) run in CI as
 
 ## Troubleshooting
 
+**`FileNotFoundError: ninja` in a PYTEST run** — same cause. `pytest` does not
+inherit the venv's `bin`, so FlashInfer's JIT cannot compile and ~34
+attention/sampling tests fail spuriously. Run them as
+`PATH=$PWD/.venv/bin:$PATH .venv/bin/python -m pytest ...`.
+
 **`FileNotFoundError: ninja`, server never binds** — FlashInfer JIT-compiles
 attention kernels and shells out to `ninja` via `PATH`. Use the launcher, or put
 `.venv/bin` first yourself.

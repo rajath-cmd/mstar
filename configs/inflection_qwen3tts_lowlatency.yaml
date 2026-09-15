@@ -20,11 +20,28 @@ model: "qwen3_tts"
 max_seq_len: 32768
 
 model_kwargs:
-  # Emit after every codec frame (80 ms of audio) instead of every 300.
-  codec_chunk_frames: 1
-  # Overlap carried into each decode so chunk seams do not click. Matches
-  # vllm-omni's codec_left_context_frames.
-  codec_left_context_frames: 25
+  # Chosen by scripts/inflection/sweep_codec_latency.sh over 7 arms on a B200,
+  # each verified COMPLETE (transcribed, opening words present) and CLEAN (no
+  # clicks or discontinuities at chunk seams):
+  #
+  #   chunk  ctx   TTFA c=1   TTFA c=32   xRT c=32
+  #       2    1       41ms       177ms       85.9   <- this profile
+  #       4    2       53ms       211ms       90.3
+  #       8    2       75ms       258ms       94.6
+  #      16    4      117ms       363ms       98.0
+  #      32    8      203ms       553ms       99.5
+  #     300   25      335ms      1313ms       65.5   <- checkpoint default
+  #
+  # The stock 300 is worst at BOTH latency and throughput once streaming: large
+  # chunks stall the pipeline instead of filling it. Past chunk=8 the throughput
+  # curve flattens while TTFA keeps climbing, so the trade only bites at the top
+  # end. chunk=2 buys the lowest TTFA for ~14% of peak throughput, and still
+  # beats the default's throughput by 1.3x.
+  #
+  # chunk MUST exceed ctx — LeftContextChunkPolicy advances by chunk - ctx on
+  # its first pop, and a violating pair silently drops the start of the stream.
+  codec_chunk_frames: 2
+  codec_left_context_frames: 1
 
 resources:
   talker_attn:
