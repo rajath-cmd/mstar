@@ -10,6 +10,7 @@ yet on M*'s Walk Graph engine. See [What is and is not done](#what-is-and-is-not
 
 - [How the model works](#how-the-model-works) — read this first
 - [Quick start](#quick-start)
+- [Docker](#docker)
 - [API](#api)
 - [Verifying correctness](#verifying-correctness)
 - [Benchmarks](#benchmarks)
@@ -107,6 +108,48 @@ extractor lives in `transformers>=5.16`, and M* pins 4.57 for the Qwen3-TTS
 path; upgrading transformers to obtain one feature extractor would put a working
 production stack at risk. The port is ~15 lines of STFT and was verified
 bit-identical to the reference (max abs diff `0.000e+00`).
+
+---
+
+## Docker
+
+Verified end to end: built, run on a mounted checkpoint, and transcribing
+correctly on English and Chinese.
+
+```bash
+docker build -f docker/Dockerfile.voxtral-rt -t inflection/voxtral-rt-mstar:latest .
+
+CKPT=/mnt/data/models/audio/stt/voxtral-rt/pretrained/Voxtral-Mini-4B-Realtime-2602
+docker run -d --name voxtral-rt --gpus '"device=0"' --ipc=host -p 8200:8200 \
+  -v "$CKPT":/checkpoint:ro \
+  --restart unless-stopped \
+  inflection/voxtral-rt-mstar:latest
+
+until curl -sf http://127.0.0.1:8200/health >/dev/null; do sleep 2; done
+
+curl -X POST http://127.0.0.1:8200/v1/audio/transcriptions \
+  -F "file=@sample.wav" -F "response_format=text"
+```
+
+Weights are not baked in: one image serves any Voxtral-Realtime checkpoint.
+The image is ~15 GB and the server is ready ~2 s after start (weight load only
+— there is no CUDA-graph capture to wait for, unlike the Qwen3-TTS image's
+4–7 minutes).
+
+| env | default | meaning |
+|---|---|---|
+| `VOXTRAL_MODEL_PATH` | `/checkpoint` | checkpoint directory (mounted) |
+| `VOXTRAL_PORT` | `8200` | listen port |
+
+The entrypoint checks for `config.json`, `model.safetensors` and `tekken.json`
+and exits with a readable message rather than failing inside model loading.
+`tekken.json` is load-bearing twice: it is the tokenizer, and it drives the
+audio padding that aligns mel frames to text positions.
+
+The build itself asserts that `numpy` stayed on 2.x and that `mistral_common`,
+`python-multipart` and `soundfile` import — each has broken quietly at least
+once, and a missing multipart parser turns every upload into a 400 that says
+nothing about the cause.
 
 ---
 
