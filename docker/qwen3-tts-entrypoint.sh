@@ -17,7 +17,7 @@ done
 [[ -f "$CONFIG" ]] || die "config not found: $CONFIG"
 
 if [[ -f "$MODEL/pointer_head.pt" ]]; then
-    echo "note: pointer_head.pt present (word timestamps land in Phase 3; M* does not read it yet)"
+    echo "note: pointer_head.pt present — word timestamps available (timestamp_type=word)"
 else
     echo "note: no pointer_head.pt — word-timestamp requests return no words"
 fi
