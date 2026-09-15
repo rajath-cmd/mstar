@@ -116,6 +116,17 @@ async def run_level(base: str, conc: int, voice: str, timeout: float, reps: int)
         "total_s": agg("total_s"), "rtf": agg("rtf"),
         "audio_s_mean": statistics.fmean(r["audio_s"] for r in ok),
         "xrt_aggregate": sum(r["audio_s"] for r in ok) / wall if wall > 0 else None,
+        # Raw per-request values, so any percentile can be recomputed later
+        # without re-running the sweep. A summary that keeps only p50/p90 makes
+        # the tail -- which is what actually decides whether a config ships --
+        # unrecoverable, and re-running a ladder to get p99 costs GPU-hours.
+        "samples": {
+            "ttfa_ms": [r["ttfa_s"] * 1000 for r in ok if r.get("ttfa_s") is not None],
+            "rtf": [r["rtf"] for r in ok if r.get("rtf") is not None],
+            "total_s": [r["total_s"] for r in ok if r.get("total_s") is not None],
+            "audio_s": [r["audio_s"] for r in ok if r.get("audio_s") is not None],
+        },
+        "wall_s": wall,
     }
 
 
