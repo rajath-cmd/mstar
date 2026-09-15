@@ -428,13 +428,29 @@ WebSocket TTFA, `tts_ws_ttfa`:
 
 Read honestly:
 
-- **At concurrency 1 the two are equivalent on TTFA** (39 vs 44 ms — inside
-  run-to-run noise, and vllm-omni is nominally ahead). Anyone quoting a
-  single-stream latency win is quoting noise.
-- **The difference is what happens under load.** M* holds RTF under 1.0 through
-  c=32; vllm-omni crosses 1.0 between c=8 and c=16, meaning it can no longer
-  keep up with realtime playback. For a voice agent that is the capacity
-  ceiling, and it arrives long before any error does.
+- **At concurrency 1, vllm-omni's first byte arrives ~4 ms earlier** (40 vs
+  44 ms; reproducible over 24 reps, spread under 1 ms on M*). That is a real,
+  repeatable difference, and it is a chunk-size trade rather than an engine
+  one: vllm-omni's codec emits **80 ms** of audio per frame, M* emits **160 ms**
+  (`codec_chunk_frames=2`). M* therefore needs two decoded frames before its
+  first emission where vllm-omni needs one, and delivers twice the audio when
+  it arrives.
+
+  M* cannot go lower. `codec_chunk_frames=1` requires
+  `codec_left_context_frames=0` to satisfy `chunk > left_context`, and that
+  configuration produces **no audio at all** — the server starts, accepts
+  requests, and neither REST nor WebSocket ever emits a frame (verified). Two
+  frames is the floor.
+
+  Whether 4 ms matters is a product judgement: it is well under the ~100 ms
+  humans notice, and M*'s TTFA is also far more *predictable* (0.8 ms spread
+  across the corpus vs 5.1 ms for vllm-omni), which matters more for a
+  pipeline budgeting end-to-end turn latency.
+
+- **Everything above concurrency 1 goes the other way, decisively.** M* holds
+  RTF under 1.0 through c=32; vllm-omni crosses 1.0 between c=8 and c=16,
+  meaning it can no longer keep up with realtime playback. For a voice agent
+  that is the capacity ceiling, and it arrives long before any error does.
 - At c=32 M* is 7.8x lower batch latency, 6.6x throughput, 2.75x lower TTFA.
 - Both arms 100% success at every level.
 
