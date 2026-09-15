@@ -38,6 +38,22 @@ class VoxtralInputs:
     audio_seconds: float
 
 
+def resample(audio: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Linear-interpolation resample to the model's rate.
+
+    Deliberately simple: the model only ever sees 16 kHz, so this is a
+    convenience for callers who send something else, not a hot path. It exists
+    at all because accepting audio at the wrong rate silently would shift every
+    timestamp -- a 24 kHz clip read as 16 kHz stretches by 1.5x.
+    """
+    if sr_in == sr_out:
+        return np.asarray(audio, dtype=np.float32)
+    n_out = int(round(len(audio) * sr_out / sr_in))
+    x_in = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+    x_out = np.linspace(0.0, 1.0, num=n_out, endpoint=False)
+    return np.interp(x_out, x_in, audio).astype(np.float32)
+
+
 @lru_cache(maxsize=4)
 def _mel_filters(n_fft: int, n_mels: int, sampling_rate: int) -> np.ndarray:
     return mel_filter_bank(

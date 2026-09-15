@@ -1,0 +1,20 @@
+# Vanilla Voxtral-Realtime (no auxiliary heads) on M*'s Walk Graph engine.
+#
+#   MSTAR_MODEL_PATH=/path/to/Voxtral-Mini-4B-Realtime-2602 \
+#     scripts/inflection/launch_mstar_voxtral_rt.sh 8300
+#
+# Both nodes sit on one rank. The audio tower runs a single dense causal pass
+# per request and keeps no KV cache, so there is nothing to gain from giving it
+# its own device -- and a great deal to lose in tensor transfer, since its
+# output is read once per 80 ms for the life of the request.
+
+model: "voxtral_rt"
+
+# A request is exactly audio_seconds * 12.5 positions long, so this is a bound
+# on utterance LENGTH, not on a context window: 8192 is ~11 minutes of audio.
+max_seq_len: 8192
+
+node_groups:
+  - node_names: [audio_tower, decoder]
+    ranks: [0]
+    graph_walks: [prefill, decode]

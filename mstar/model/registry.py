@@ -13,6 +13,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
+    "voxtral_rt": ("mstar.model.voxtral_rt.voxtral_rt_model", "VoxtralRealtimeModel"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
@@ -44,6 +45,10 @@ HF_MODELS: dict[str, dict] = {
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.
+    # Vanilla Voxtral-Realtime (no auxiliary heads). Normally served from a
+    # local directory -- $VOXTRAL_MODEL_PATH or the path given as the model --
+    # because the checkpoint is large and already on disk.
+    "voxtral_rt": {"model_path_hf": "mistralai/Voxtral-Mini-4B-Realtime-2602"},
     "vjepa2": {"model_path_hf": "facebook/vjepa2-vitl-fpc64-256"},
     # V-JEPA 2-AC (encoder + action-conditioned predictor).  HF doesn't host
     # an AC checkpoint; weights come from the public S3 mirror
