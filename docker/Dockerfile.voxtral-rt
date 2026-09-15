@@ -1,0 +1,92 @@
+# Voxtral-Realtime (vanilla) serving image — OpenAI transcription API on M*.
+#
+# Build from the repository root:
+#
+#   docker build -f docker/Dockerfile.voxtral-rt -t inflection/voxtral-rt-mstar:latest .
+#
+# Weights are NOT baked in. Mount a checkpoint and point $VOXTRAL_MODEL_PATH at
+# it, so one image serves any Voxtral-Realtime checkpoint:
+#
+#   docker run -d --name voxtral-rt --gpus '"device=0"' --ipc=host -p 8200:8200 \
+#     -v /path/to/Voxtral-Mini-4B-Realtime-2602:/checkpoint:ro \
+#     inflection/voxtral-rt-mstar:latest
+#
+#   curl -X POST http://127.0.0.1:8200/v1/audio/transcriptions \
+#     -F "file=@sample.wav" -F "response_format=json"
+#
+# The checkpoint directory needs config.json, model.safetensors and tekken.json.
+# tekken.json is not optional: it is the reference tokenizer, and it also drives
+# the audio padding that aligns mel frames to text positions.
+#
+# SCOPE: this image serves the bring-up server — one request at a time, no
+# continuous batching, no paged attention, no CUDA graphs. Single-stream RTF is
+# ~0.17 on a B200; concurrency is flat by construction. See
+# docs/inflection/voxtral-rt/README.md.
+
+ARG CUDA_IMAGE=docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+FROM ${CUDA_IMAGE} AS cuda-base
+FROM cuda-base AS voxtral-rt
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_VERSION=2.9.1
+ARG TORCHVISION_VERSION=0.24.1
+ARG TORCHAUDIO_VERSION=2.9.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+RUN uv venv --python 3.12 --seed /opt/mstar/venv \
+    && uv pip install --python /opt/mstar/venv/bin/python \
+        --index-url ${TORCH_INDEX} \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION}
+
+WORKDIR /opt/mstar/src
+COPY . .
+
+RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all]" \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION}
+
+# mistral-common pins numpy<2.4 while M* runs 2.5.x. Installing it normally
+# downgrades numpy across the whole image, which breaks other model paths, so
+# it goes in WITHOUT its dependency resolution and its real runtime needs are
+# listed explicitly. It is required, not optional: it is the reference
+# tokenizer AND it computes the audio padding that aligns mel frames to text
+# positions.
+RUN uv pip install --python /opt/mstar/venv/bin/python --no-deps \
+        "mistral-common==1.11.7" tiktoken jsonschema jsonschema-specifications \
+        referencing rpds-py pycountry pydantic-extra-types \
+    && uv pip install --python /opt/mstar/venv/bin/python \
+        "fastapi" "uvicorn[standard]" "python-multipart" "soundfile"
+
+ENV PATH=/opt/mstar/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    HF_TOKEN_PATH=/dev/null \
+    VOXTRAL_MODEL_PATH=/checkpoint \
+    VOXTRAL_PORT=8200
+
+# Fail the BUILD, not a caller's first request. Each of these has broken
+# quietly at least once: a missing multipart parser turns every upload into a
+# 400 with no hint; a missing numpy pin silently downgrades and breaks torch.
+RUN /opt/mstar/venv/bin/python -c "\
+import numpy, mistral_common, multipart, soundfile; \
+from mstar.model.voxtral_rt.model import VoxtralRealtime; \
+from mstar.model.voxtral_rt.serving.app import build_app; \
+assert numpy.__version__.startswith('2.'), numpy.__version__; \
+print('voxtral deps OK; numpy', numpy.__version__)"
+
+COPY docker/voxtral-rt-entrypoint.sh /usr/local/bin/voxtral-rt-entrypoint.sh
+RUN chmod +x /usr/local/bin/voxtral-rt-entrypoint.sh
+
+EXPOSE 8200
+HEALTHCHECK --interval=15s --timeout=5s --start-period=180s --retries=10 \
+    CMD curl -fsS http://127.0.0.1:${VOXTRAL_PORT}/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/voxtral-rt-entrypoint.sh"]
