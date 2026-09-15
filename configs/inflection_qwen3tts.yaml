@@ -7,10 +7,19 @@
 model: "qwen3_tts"
 max_seq_len: 32768
 
-model_kwargs:
-  # Local checkpoint dir. _resolve_model_metadata treats an existing path as a
-  # local snapshot and skips the Hub entirely.
-  model_path_hf: "/mnt/data/models/audio/tts/qwen3-tts/sft-cv-13l-14pv-ticr-1e-13l-fulldata_17946/checkpoint-final"
+# Weights are NOT pinned here on purpose. Set $MSTAR_MODEL_PATH to a checkpoint
+# directory (see _resolve_model_path in api_server/entrypoint.py), which is how
+# the serving image is driven — a container mounts a checkpoint and points the
+# env var at it, with no baked-in absolute path to edit.
+#
+#   export MSTAR_MODEL_PATH=/path/to/qwen3-tts/checkpoint-final
+#
+# The directory needs config.json, generation_config.json, model.safetensors and
+# speech_tokenizer/config.json. To pin a deployment to one checkpoint instead,
+# add `model_kwargs: {model_path_hf: /path}` here — yaml wins over the env var.
+#
+# NOTE: this requires a 1.7B-capable M* (see Gate 0b in the parity spec). Stock
+# M* rejects unequal Talker/CodePredictor hidden sizes.
 
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.

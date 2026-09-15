@@ -232,12 +232,28 @@ class Qwen3TTSCodePredictor(nn.Module):
     def __init__(self, config: Qwen3TTSModelConfig) -> None:
         super().__init__()
         cp = config.code_predictor
-        if cp.hidden_size != config.talker.hidden_size:
-            raise ValueError(
-                "M* currently requires equal Talker and CodePredictor hidden "
-                "sizes; the supported 0.6B checkpoint uses 1024 for both"
-            )
         self.config = cp
+        # Talker and CodePredictor hidden sizes are equal on the 0.6B (1024
+        # both) but NOT on the 1.7B, which runs a 2048 Talker into a 1024 depth
+        # decoder. The checkpoint ships the bridge for that case as
+        # ``talker.code_predictor.small_to_mtp_projection`` (2048 -> 1024, with
+        # bias); the loader binds it by attribute name.
+        #
+        # Everything entering the depth decoder is at the TALKER dim — the
+        # Talker hidden at depth position 0, and ``codec_embedding``, which
+        # ``Qwen3TTSCodePredictorInnerModel`` already sizes at
+        # ``config.talker.hidden_size``. So the projection belongs at the entry
+        # to ``forward_depth_unrolled``, which is the one point both paths pass
+        # through, and ``codec_embed_sum`` keeps accumulating at the Talker dim
+        # for the feedback embedding the Talker consumes next frame.
+        #
+        # Equal dims use Identity: the 0.6B checkpoint carries no projection
+        # weight, so a Linear here would fail _verify_loaded.
+        self.small_to_mtp_projection: nn.Module = (
+            nn.Identity()
+            if cp.hidden_size == config.talker.hidden_size
+            else nn.Linear(config.talker.hidden_size, cp.hidden_size, bias=True)
+        )
         self.model = Qwen3TTSCodePredictorInnerModel(config)
         self.lm_head = nn.ModuleList([
             nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
@@ -275,7 +291,9 @@ class Qwen3TTSCodePredictor(nn.Module):
         head_dim]``. Unlike Talker cache, it is frame-local scratch space:
         every generated frame starts at ``cache_pos=0`` and overwrites it.
         """
-        hidden_states = inputs_embeds
+        # Down-project from the Talker hidden size when they differ (1.7B);
+        # Identity when they match (0.6B). One Linear, so this stays graph-safe.
+        hidden_states = self.small_to_mtp_projection(inputs_embeds)
         batch_size, seq_len, _ = hidden_states.shape
         if seq_len != 1:
             raise ValueError("CodePredictor decode expects exactly one token")

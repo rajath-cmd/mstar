@@ -45,6 +45,30 @@ for _mod, _exts in {
         _EXT_TO_MODALITY[_ext] = _mod
 
 
+
+def _resolve_model_path(model_name: str, yaml_model_kwargs: dict) -> str:
+    """Where this deployment's weights come from, highest precedence first.
+
+    1. ``model_kwargs.model_path_hf`` in the yaml — pins a deployment to one
+       checkpoint, and is popped rather than forwarded because it is also
+       passed explicitly (duplicate keyword otherwise).
+    2. ``$MSTAR_MODEL_PATH`` — lets a container point at a mounted checkpoint
+       without editing a baked-in yaml, which is how the serving image is
+       driven.
+    3. The ``HF_MODELS`` registry default — the stock Hub repo.
+
+    Before this existed the registry default was the only option, so M* could
+    not serve a local fine-tune at all even though ``_resolve_model_metadata``
+    already accepted a local directory.
+    """
+    from_yaml = yaml_model_kwargs.pop("model_path_hf", None)
+    if from_yaml:
+        return str(from_yaml)
+    from_env = os.environ.get("MSTAR_MODEL_PATH", "").strip()
+    if from_env:
+        return from_env
+    return HF_MODELS.get(model_name, {}).get("model_path_hf", "")
+
 def _detect_modality(filename: str) -> str:
     return _EXT_TO_MODALITY.get(Path(filename).suffix.lower(), "unknown")
 
@@ -99,9 +123,7 @@ def _conductor_process_target(
     # without this override there was no way to reach it. Popped rather than
     # forwarded because it is also passed explicitly below (duplicate keyword).
     yaml_model_kwargs = dict(yaml_model_kwargs)
-    model_path_hf = yaml_model_kwargs.pop("model_path_hf", None) or HF_MODELS.get(model_name, {}).get(
-        "model_path_hf", ""
-    )
+    model_path_hf = _resolve_model_path(model_name, yaml_model_kwargs)
     model = get_model_class(model_name)(
         model_path_hf=model_path_hf,
         cache_dir=cache_dir,
@@ -955,9 +977,7 @@ def main(argv: list[str] | None = None):
     # Same override as the conductor-side construction above — the two model
     # instances must resolve to the same weights or they silently diverge.
     yaml_model_kwargs = dict(yaml_model_kwargs)
-    model_path_hf = yaml_model_kwargs.pop("model_path_hf", None) or HF_MODELS.get(model_name, {}).get(
-        "model_path_hf", ""
-    )
+    model_path_hf = _resolve_model_path(model_name, yaml_model_kwargs)
     model = get_model_class(model_name)(
         model_path_hf=model_path_hf,
         cache_dir=args.cache_dir,
