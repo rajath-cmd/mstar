@@ -13,19 +13,18 @@ from fastapi.responses import JSONResponse
 def _speakers(api) -> list[str]:
     """Read the loaded checkpoint's speakers, lowercased and sorted.
 
-    Never hardcoded: the set is per-checkpoint (the stock 0.6B ships different
-    names from our fine-tunes), and the Qwen3-TTS preprocessor already rejects
-    an unknown speaker with the supported list, so these must be the same names.
+    Deliberately the SAME source the preprocessor validates against —
+    ``config.talker.spk_id``, whose keys it lists verbatim when it rejects an
+    unknown speaker (``qwen3_tts_model.py``). Reading anything else would let
+    this endpoint advertise a voice that /v1/audio/speech then refuses, which is
+    worse than advertising none.
+
+    Never hardcoded: the set is per-checkpoint. The stock 0.6B ships "vivian";
+    our 14-voice fine-tunes ship alexandra..steven.
     """
-    model = getattr(api, "model", None)
-    if model is None:
-        return []
-    config = getattr(model, "config", None)
-    for owner in (getattr(config, "talker", None), config):
-        raw = getattr(owner, "speakers", None)
-        if raw:
-            return sorted({str(s).lower() for s in raw})
-    return []
+    config = getattr(getattr(api, "model", None), "config", None)
+    spk_id = getattr(getattr(config, "talker", None), "spk_id", None) or {}
+    return sorted({str(name).lower() for name in spk_id})
 
 
 async def list_voices(api) -> JSONResponse:

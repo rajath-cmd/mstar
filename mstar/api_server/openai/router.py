@@ -49,10 +49,15 @@ def _api():
     return None
 
 
-def _error(status: int, message: str, type_: str = "invalid_request_error") -> JSONResponse:
+def _error(
+    status: int, message: str, type_: str = "invalid_request_error", param: str | None = None
+) -> JSONResponse:
+    """OpenAI-style error envelope. ``param`` is present (usually null) because
+    vllm-omni emits it and a client that reads ``error.param`` would otherwise
+    KeyError against M*."""
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": type_, "code": status}},
+        content={"error": {"message": message, "type": type_, "param": param, "code": status}},
     )
 
 

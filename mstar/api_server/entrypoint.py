@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -724,6 +726,42 @@ app.add_middleware(
 )
 
 api_server: APIServer | None = None
+
+
+@app.exception_handler(RequestValidationError)
+async def _openai_validation_error(request: Request, exc: RequestValidationError):
+    """Request-validation failures on /v1/* answer 400 in the OpenAI envelope.
+
+    FastAPI's default is 422 with a bare ``{"detail": [...]}`` body, which
+    diverges from vllm-omni twice over — status AND shape — so a client that
+    branches on ``response.status_code == 400`` or reads ``error.message``
+    breaks when pointed at M*. Caught by the differential parity suite
+    (test/parity), which is exactly the class of drift it exists to catch.
+
+    Scoped to /v1/*: ``/generate`` is M*'s native endpoint, not one this fork
+    claims parity for, and keeps FastAPI's default so its existing clients are
+    unaffected.
+
+    The message reproduces the validation errors but NOT vllm-omni's literal
+    string — that one embeds a server-side traceback with absolute paths, which
+    is a bug to copy rather than a contract to honour.
+    """
+    if not request.url.path.startswith("/v1/"):
+        return await request_validation_exception_handler(request, exc)
+    errors = exc.errors()
+    plural = "" if len(errors) == 1 else "s"
+    detail = "\n  ".join(str(e) for e in errors)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": f"{len(errors)} validation error{plural}:\n  {detail}",
+                "type": "Bad Request",
+                "param": None,
+                "code": 400,
+            }
+        },
+    )
 
 # Mount the OpenAI-compatible routes (/v1/*) alongside the native /generate.
 # The router resolves the loaded model's adapter lazily per request, so models

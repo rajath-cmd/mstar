@@ -80,8 +80,22 @@ def assert_batch_returns_one_result_per_input(base_url: str, voice: str) -> None
 
 
 def assert_rejects_unknown_timestamp_type(base_url: str, voice: str) -> None:
+    """A bad enum answers 400 in the OpenAI error envelope.
+
+    Not FastAPI's default 422 + ``{"detail": [...]}``: vllm-omni answers 400 and
+    a client branching on the status or reading ``error.message`` would break on
+    the other shape. The literal message text is NOT asserted — vllm-omni's
+    embeds a server-side traceback with absolute paths, which is a bug to
+    tolerate, not a contract to pin.
+    """
     r = post_speech(base_url, {"input": "Hi.", "voice": voice, "timestamp_type": "phoneme"})
-    assert r.status_code == 422, f"expected 422, got {r.status_code}: {r.text[:200]}"
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text[:200]}"
+    err = r.json().get("error")
+    assert isinstance(err, dict), f"expected an 'error' envelope, got {sorted(r.json())}"
+    for key in ("message", "type", "param", "code"):
+        assert key in err, f"error envelope missing {key!r}; got {sorted(err)}"
+    assert err["code"] == 400
+    assert "timestamp_type" in err["message"], "error does not name the offending field"
 
 
 def assert_lists_voices(base_url: str, voice: str) -> None:
