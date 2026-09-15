@@ -247,21 +247,49 @@ This is the *reason* for the port, so it is a target, not just a floor:
 
 ## Phase roadmap
 
-Each phase is an independently reviewable, independently shippable unit with its own
-plan document. Gates are hard: a failed gate stops the phase rather than being worked
-around.
+Status as of 2026-09-15. Each phase is independently reviewable and shippable.
 
-| Phase | Deliverable | Gate |
+| Phase | Deliverable | Status |
 |---|---|---|
-| **0** | Branch, protection, this spec, conformance-suite skeleton, golden traces from vllm-omni | Repo visibility resolved (Gate 0) |
-| **0b** | **1.7B support**: `small_to_mtp_projection`, Talker-dim `codec_embedding`, drop the equality check | M* serves `checkpoint-final` and `/generate` returns audio. **Blocks every other phase.** |
-| **1** | `Qwen3TTSAdapter`; full `SpeechRequest`; voices endpoints; REST conformance green | REST differential suite passes L1+L2 for every non-timestamp field |
-| **2** | WS `/v1/audio/speech/stream`: session protocol, chunker, inter-chunk pause, cancel, multi-turn, audio-stall guard | WS golden-trace replay passes L1+L2 |
-| **3** | Temporal alignment: aux-layer capture, pointer head, Viterbi, streaming commit horizon, incremental emission | Spike (Task 1) proves layer-3 capture at prefill + decode; then L3 within CI on blind30 |
-| **4** | Prometheus metrics (identical names), OTel spans, structured logs, Grafana dashboard | `/metrics` exposes the same series names vllm-omni does |
-| **5** | Low-latency configuration sweep: TP/SP mesh, CUDA-graph mode, codec chunk policy, FA backend, disaggregation | A configuration that meets the L4 floor |
-| **6** | Apples-to-apples benchmark harness; Plotly HTML + matplotlib PNG; parity report | L4 measured and published, pass or fail |
-| **7** | Serving Dockerfile, image build docs, drop-in validation against the pipecat client | pipecat runs unmodified against the M* image |
+| **0** | Branch, protection, spec, conformance harness | **DONE** — `inflection/qwen3-tts`, both branches protected, 3 suites live |
+| **0b** | 1.7B support (`small_to_mtp_projection`) | **DONE** `4ad3a07` — verified by transcription |
+| **1** | REST parity: adapter, 19-field request, voices | **DONE** `a9a4192` — 12/12 both servers |
+| **2** | WebSocket protocol, chunker, cancel, runaway cap | **DONE** `562056f` — 16/16 both servers |
+| **3** | Temporal alignment | **IN PROGRESS** `11d3b3a` — package ported (132 tests), head loads, aux tap added; capture→emit wiring remains |
+| **4** | Prometheus / OTel / Grafana | not started — `_metrics.py` is the no-op seam to replace |
+| **5** | Low-latency configuration | **DONE** — swept 7 arms, `chunk=2 ctx=1` chosen |
+| **6** | Apples-to-apples benchmarks | **DONE** — REST + WS harnesses, Plotly + PNG |
+| **7** | Image + docs | **DONE** `562056f` — 15.6 GB image, 314-line guide |
+
+### Measured results
+
+**Performance** (identical checkpoint, one B200 per arm, interleaved):
+
+| metric | M* | vllm-omni |
+|---|---|---|
+| batch latency p50 @ c=32 | 1317 ms | 9088 ms (**6.9× worse**) |
+| batch throughput @ c=32 | 66.6× RT | 13.0× RT |
+| WS TTFA p50 @ c=1 | 41 ms | 40 ms |
+| WS TTFA p50 @ c=32 | 177 ms | 496 ms (**2.8× worse**) |
+| RTF @ c=32 | 0.27 | 2.18 (**slower than realtime**) |
+
+vllm-omni crosses RTF = 1 between 8 and 16 concurrent requests. M* stays under
+0.3 at 32.
+
+**Parity:** 28/28 REST + WebSocket green on both servers. Alignment 3/3 red on
+M*, by design, until Phase 3 completes.
+
+### Bugs this work found
+
+Four, each caught by measurement rather than by reading code:
+
+1. **M* could not serve the 1.7B at all** — hard-rejected unequal Talker/CodePredictor hidden sizes, though the checkpoint ships the bridge.
+2. **Validation errors diverged twice over** — 422 + `detail` vs 400 + `error` envelope. Any client branching on either breaks.
+3. **`voice.list` placement** — vllm-omni's docstring contradicts its implementation. Building to the docstring would have looked *more* capable while being less compatible.
+4. **`chunk_frames=1` silently truncated audio** — best-looking TTFA in the sweep, and wrong. `LeftContextChunkPolicy` advanced by `1 - 25 = -24`, dropping the start of every stream while still sounding fluent. Caught by the fairness gate and transcription; now rejected at construction.
+
+Plus two in vllm-omni: REST streaming re-sends cumulatively, and no runaway cap
+existed in M* at all.
 
 **Sequencing note.** Phase 4 (metrics) is deliberately *after* Phase 3 rather than early:
 several of the metric series that matter (`tts_alignment_*`, including the

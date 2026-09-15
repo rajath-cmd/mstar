@@ -24,6 +24,7 @@ lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 
 import importlib.metadata
 import importlib.util
+import logging
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -764,6 +765,32 @@ class Qwen3TTSModel(Model):
             stacked_params=LLAMA_STACKED_PARAMS,
         )
         self._verify_loaded(talker, loaded, "Qwen3-TTS Talker")
+
+        # Word-timestamp alignment head (optional sidecar). Loading it here, at
+        # weight-load time, sets the Talker's aux-layer tap ONCE — the decode
+        # path is CUDA-graph captured, so the tap cannot be toggled per request.
+        # A checkpoint without pointer_head.pt simply leaves the tap off and the
+        # server answers word-timestamp requests with no words, which is exactly
+        # what vllm-omni does in the same situation.
+        talker.alignment_head = None
+        talker.alignment_layer = None
+        try:
+            from mstar.model.qwen3_tts.temporal_alignment.load_head import (
+                find_pointer_head,
+                load_pointer_head_from_pt,
+            )
+
+            head_path = find_pointer_head(self.local_dir)
+            if head_path is not None:
+                head, layer = load_pointer_head_from_pt(
+                    head_path, device=device, dtype=autocast_dtype
+                )
+                talker.alignment_head = head
+                talker.alignment_layer = layer
+                talker.aux_hidden_state_layer = layer
+        except Exception as e:  # noqa: BLE001 — never let the sidecar break serving
+            logging.getLogger(__name__).warning("alignment head load failed; word timestamps disabled: %s", e)
+
         talker.eval()
 
         # CodePredictor is small and depth-wise. It is loaded separately from
