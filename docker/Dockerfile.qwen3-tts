@@ -19,11 +19,12 @@
 #
 # The checkpoint directory needs config.json, generation_config.json,
 # model.safetensors and speech_tokenizer/config.json. A pointer_head.pt beside
-# them enables word timestamps (Phase 3; not yet consumed by M*).
+# them enables word timestamps (timestamp_type=word); without one, those
+# requests return no words rather than an error.
 #
 # Profiles (MSTAR_TTS_CONFIG):
 #   configs/inflection_qwen3tts_lowlatency.yaml  (default here) — voice agents.
-#       codec_chunk_frames=1: audio leaves after every 80 ms frame.
+#       codec_chunk_frames=2: audio leaves after every 160 ms of frames.
 #   configs/inflection_qwen3tts.yaml — batch/offline. The checkpoint's stock
 #       codec_chunk_frames=300 buffers 24 s before the first byte: higher
 #       throughput, unusable TTFA.
